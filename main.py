@@ -64,8 +64,10 @@ class VLLMBenchmark:
             "inference_time": [],
             "prefill_time": [],
             "decode_time": [],
+            "finished_requests": [],  # New metric for finished request count
         }
         self.request_count = 0
+        self.finished_request_count = 0  # Counter for finished requests
         self.metrics_session: Optional[aiohttp.ClientSession] = None
         self.load_session: Optional[aiohttp.ClientSession] = None
         self.start_time: Optional[float] = None
@@ -172,6 +174,11 @@ class VLLMBenchmark:
                 else:
                     self.metrics_data["pending_requests"].append(0)
 
+                # Update finished request count from client-side counter
+                self.metrics_data["finished_requests"].append(
+                    self.finished_request_count
+                )
+
                 # Update previous values for rate calculations
                 if metrics["prompt_tokens"] is not None:
                     self.prev_prompt_tokens = metrics["prompt_tokens"]
@@ -220,6 +227,9 @@ class VLLMBenchmark:
             ) as response:
                 if response.status == 200:
                     self.request_count += 1
+                    self.finished_request_count += (
+                        1  # Increment finished request counter
+                    )
                 elif response.status == 401:
                     logger.error("Authentication failed: Invalid or missing API key")
                 else:
@@ -395,6 +405,15 @@ class VLLMBenchmark:
                 f"Total decode time requests: {self.metrics_data['decode_time'][-1]}"
             )
 
+        # Log finished request count if available
+        if (
+            self.metrics_data["finished_requests"]
+            and len(self.metrics_data["finished_requests"]) > 0
+        ):
+            logger.info(
+                f"Total finished requests (client-side): {self.metrics_data['finished_requests'][-1]}"
+            )
+
     def render_diagrams(self) -> None:
         """Render metrics as an HTML page with Plotly diagrams."""
         times = np.array(self.metrics_data["time"])
@@ -451,6 +470,22 @@ class VLLMBenchmark:
                     y=self.metrics_data["request_success"],
                     mode="lines+markers",
                     name="Successful Requests",
+                ),
+                row=4,
+                col=1,
+            )
+
+        # Add finished request count if available
+        if (
+            "finished_requests" in self.metrics_data
+            and self.metrics_data["finished_requests"]
+        ):
+            fig.add_trace(
+                go.Scatter(
+                    x=times,
+                    y=self.metrics_data["finished_requests"],
+                    mode="lines+markers",
+                    name="Finished Requests",
                 ),
                 row=4,
                 col=1,
