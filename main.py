@@ -179,6 +179,25 @@ class VLLMBenchmark:
                     self.finished_request_count
                 )
 
+                # Update time to first token metric
+                if metrics["time_to_first_token"] is not None:
+                    self.metrics_data["time_to_first_token"].append(metrics["time_to_first_token"])
+                else:
+                    self.metrics_data["time_to_first_token"].append(0)
+
+                # Update prefill time metric
+                if metrics["prefill_time"] is not None:
+                    self.metrics_data["prefill_time"].append(metrics["prefill_time"])
+                else:
+                    self.metrics_data["prefill_time"].append(0)
+
+                # Update other latency metrics
+                for metric_name in ["e2e_latency", "queue_time", "inference_time", "decode_time"]:
+                    if metrics[metric_name] is not None:
+                        self.metrics_data[metric_name].append(metrics[metric_name])
+                    else:
+                        self.metrics_data[metric_name].append(0)
+
                 # Update previous values for rate calculations
                 if metrics["prompt_tokens"] is not None:
                     self.prev_prompt_tokens = metrics["prompt_tokens"]
@@ -369,6 +388,14 @@ class VLLMBenchmark:
             )
 
         if (
+            self.metrics_data["prefill_time"]
+            and len(self.metrics_data["prefill_time"]) > 0
+        ):
+            logger.info(
+                f"Total prefill time requests: {self.metrics_data['prefill_time'][-1]}"
+            )
+
+        if (
             self.metrics_data["e2e_latency"]
             and len(self.metrics_data["e2e_latency"]) > 0
         ):
@@ -387,14 +414,6 @@ class VLLMBenchmark:
         ):
             logger.info(
                 f"Total inference time requests: {self.metrics_data['inference_time'][-1]}"
-            )
-
-        if (
-            self.metrics_data["prefill_time"]
-            and len(self.metrics_data["prefill_time"]) > 0
-        ):
-            logger.info(
-                f"Total prefill time requests: {self.metrics_data['prefill_time'][-1]}"
             )
 
         if (
@@ -494,6 +513,7 @@ class VLLMBenchmark:
         # Add latency metrics if available
         latency_metrics = [
             ("time_to_first_token", "Time to First Token (s)", 4, 2),
+            ("prefill_time", "Prefill Time (s)", 4, 2),
             ("e2e_latency", "End-to-End Latency (s)", 4, 2),
             ("queue_time", "Queue Time (s)", 4, 2),
             ("inference_time", "Inference Time (s)", 4, 2),
