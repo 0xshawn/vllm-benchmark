@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-import asyncio
-import aiohttp
 import argparse
+import asyncio
+import json
 import logging
+import os
 import time
 from datetime import datetime
 from typing import Dict, List, Optional
+
+import aiohttp
 import numpy as np
 import plotly.graph_objs as go
 from plotly.subplots import make_subplots
 from prometheus_client.parser import text_string_to_metric_families
-import os
-import json
 
 # Configure logging
 logging.basicConfig(
@@ -65,19 +66,22 @@ class VLLMBenchmark:
             "decode_time": [],
         }
         self.request_count = 0
-        self.session: Optional[aiohttp.ClientSession] = None
+        self.metrics_session: Optional[aiohttp.ClientSession] = None
+        self.load_session: Optional[aiohttp.ClientSession] = None
         self.start_time: Optional[float] = None
+        self.finish_time: Optional[float] = None
         self.output_dir = "benchmark_results"
         os.makedirs(self.output_dir, exist_ok=True)
         # For rate calculations
         self.prev_prompt_tokens = 0.0
         self.prev_generation_tokens = 0.0
         self.prev_time: Optional[float] = None
+        self.stop_event = asyncio.Event()
 
     async def fetch_metrics(self) -> None:
         """Fetch and parse metrics from vLLM /metrics endpoint."""
         try:
-            async with self.session.get(self.metrics_url) as response:
+            async with self.metrics_session.get(self.metrics_url) as response:
                 if response.status != 200:
                     logger.error(f"Failed to fetch metrics: HTTP {response.status}")
                     return
@@ -211,7 +215,7 @@ class VLLMBenchmark:
             headers = (
                 {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
             )
-            async with self.session.post(
+            async with self.load_session.post(
                 f"{self.vllm_url}/v1/chat/completions", json=payload, headers=headers
             ) as response:
                 if response.status == 200:
@@ -219,35 +223,100 @@ class VLLMBenchmark:
                 elif response.status == 401:
                     logger.error("Authentication failed: Invalid or missing API key")
                 else:
-                    logger.error(f"Request failed: HTTP {response.status}")
+                    logger.error(
+                        f"Request failed: HTTP {response.status}, {await response.text()}"
+                    )
         except Exception as e:
             logger.error(f"Request error: {e}")
 
+    def _should_stop_early(self, check_tasks: bool = False) -> bool:
+        """Check if the benchmark should stop early because all requests are completed.
+
+        Args:
+            check_tasks: If True, also check if there are no pending tasks.
+
+        Returns:
+            bool: True if the benchmark should stop early, False otherwise.
+        """
+        # Only check after 60 seconds
+        if time.time() - self.start_time <= 60:
+            return False
+
+        # Check if all requests are completed
+        if not self.metrics_data["running_requests"]:
+            return False
+        if (
+            self.metrics_data["running_requests"][-1] != 0
+            or self.metrics_data["pending_requests"][-1] != 0
+        ):
+            return False
+
+        # Optionally check if there are no pending tasks
+        if check_tasks and len(self.tasks) > 0:
+            return False
+
+        # Record finish time if not already set
+        if self.finish_time is None:
+            self.finish_time = time.time()
+            logger.info(f"All requests completed at {self.finish_time:.2f} seconds")
+            logger.info(
+                f"Total time to complete all requests: {self.finish_time - self.start_time:.2f} seconds"
+            )
+
+        return True
+
     async def monitor_metrics(self) -> None:
         """Periodically fetch metrics during the benchmark."""
-        while time.time() - self.start_time < self.duration:
+        while (
+            time.time() - self.start_time < self.duration
+            and not self.stop_event.is_set()
+        ):
             await self.fetch_metrics()
+            logger.info(
+                f"Metrics fetched at {time.time() - self.start_time:.2f} seconds"
+            )
             await asyncio.sleep(1)
+
+            # Check if all requests have been completed - only stop if we're near the end of the duration
+            if self._should_stop_early():
+                logger.info(
+                    "All requests have been completed. Stopping benchmark early."
+                )
+                self.stop_event.set()
+                break
 
     async def generate_load(self) -> None:
         """Generate load at target QPS with concurrency control."""
         interval = 1.0 / self.target_qps if self.target_qps > 0 else 0
         end_time = self.start_time + self.duration
-        tasks = []
+        self.tasks = []
 
-        while time.time() < end_time:
-            if len(tasks) < self.concurrency:
-                tasks.append(asyncio.create_task(self.send_request()))
+        logger.info("Warming up...")
+        await asyncio.sleep(30)  # wait for 30 seconds to warm up
+        while time.time() < end_time and not self.stop_event.is_set():
+            # Check if all requests have been completed - only stop if we're near the end of the duration
+            if self._should_stop_early(check_tasks=True):
+                logger.info(
+                    "All requests have been completed. Stopping load generation early."
+                )
+                self.stop_event.set()
+                break
+
+            if len(self.tasks) < self.concurrency:
+                self.tasks.append(asyncio.create_task(self.send_request()))
                 if interval > 0:
                     await asyncio.sleep(interval)
             else:
                 done, pending = await asyncio.wait(
-                    tasks, timeout=interval, return_when=asyncio.FIRST_COMPLETED
+                    self.tasks, timeout=interval, return_when=asyncio.FIRST_COMPLETED
                 )
-                tasks = list(pending) + [t for t in done if not t.exception()]
+                self.tasks = list(pending) + [t for t in done if not t.exception()]
 
-        if tasks:
-            await asyncio.wait(tasks)
+        if self.tasks:
+            await asyncio.wait(self.tasks)
+
+        logger.info("Cooling down...")
+        await asyncio.sleep(30)  # wait for 30 seconds to cool down
 
     def calculate_metrics(self) -> None:
         """Calculate QPS and concurrent requests per second."""
@@ -437,8 +506,27 @@ class VLLMBenchmark:
     async def run(self) -> None:
         """Run the benchmark."""
         self.start_time = time.time()
-        async with aiohttp.ClientSession() as self.session:
-            await asyncio.gather(self.monitor_metrics(), self.generate_load())
+
+        async with aiohttp.ClientSession() as metrics_session, aiohttp.ClientSession() as load_session:
+            self.metrics_session = metrics_session
+            self.load_session = load_session
+            # Create tasks for monitoring metrics and generating load
+            monitor_task = asyncio.create_task(self.monitor_metrics())
+            load_task = asyncio.create_task(self.generate_load())
+
+            # Wait for either task to complete
+            done, pending = await asyncio.wait(
+                [monitor_task, load_task], return_when=asyncio.FIRST_COMPLETED
+            )
+
+            # Cancel the remaining task
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
         self.calculate_metrics()
         self.render_diagrams()
 
