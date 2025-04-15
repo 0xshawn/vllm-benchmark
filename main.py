@@ -523,15 +523,20 @@ class VLLMBenchmark:
             ),
         )
 
-        # Update y-axis labels
-        fig.update_yaxes(title_text="Tokens/s", row=1, col=1)
-        fig.update_yaxes(title_text="Tokens/s", row=1, col=2)
-        fig.update_yaxes(title_text="Count", row=2, col=1)
-        fig.update_yaxes(title_text="Count", row=2, col=2)
-        fig.update_yaxes(title_text="Requests/s", row=3, col=1)
-        fig.update_yaxes(title_text="Count", row=3, col=2)
-        fig.update_yaxes(title_text="Count", row=4, col=1)
-        fig.update_yaxes(title_text="Seconds", row=4, col=2)
+        # Update y-axis labels and format
+        fig.update_yaxes(title_text="Tokens/s", row=1, col=1, tickformat=".1f")
+        fig.update_yaxes(title_text="Tokens/s", row=1, col=2, tickformat=".1f")
+        fig.update_yaxes(title_text="Count", row=2, col=1, tickformat=".1f")
+        fig.update_yaxes(title_text="Count", row=2, col=2, tickformat=".1f")
+        fig.update_yaxes(title_text="Requests/s", row=3, col=1, tickformat=".1f")
+        fig.update_yaxes(title_text="Count", row=3, col=2, tickformat=".1f")
+        fig.update_yaxes(title_text="Count", row=4, col=1, tickformat=".1f")
+        fig.update_yaxes(title_text="Seconds", row=4, col=2, tickformat=".1f")
+
+        # Update x-axis format for all subplots
+        for i in range(1, 5):
+            for j in range(1, 3):
+                fig.update_xaxes(tickformat=".1f", row=i, col=j)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_file = os.path.join(self.output_dir, f"vllm_benchmark_{timestamp}.html")
