@@ -396,6 +396,14 @@ class VLLMBenchmark:
             )
 
         if (
+            self.metrics_data["decode_time"]
+            and len(self.metrics_data["decode_time"]) > 0
+        ):
+            logger.info(
+                f"Total decode time requests: {self.metrics_data['decode_time'][-1]}"
+            )
+
+        if (
             self.metrics_data["e2e_latency"]
             and len(self.metrics_data["e2e_latency"]) > 0
         ):
@@ -414,14 +422,6 @@ class VLLMBenchmark:
         ):
             logger.info(
                 f"Total inference time requests: {self.metrics_data['inference_time'][-1]}"
-            )
-
-        if (
-            self.metrics_data["decode_time"]
-            and len(self.metrics_data["decode_time"]) > 0
-        ):
-            logger.info(
-                f"Total decode time requests: {self.metrics_data['decode_time'][-1]}"
             )
 
         # Log finished request count if available
@@ -514,6 +514,7 @@ class VLLMBenchmark:
         latency_metrics = [
             ("time_to_first_token", "Time to First Token (s)", 4, 2),
             ("prefill_time", "Prefill Time (s)", 4, 2),
+            ("decode_time", "Decode Time (s)", 4, 2),
             ("e2e_latency", "End-to-End Latency (s)", 4, 2),
             ("queue_time", "Queue Time (s)", 4, 2),
             ("inference_time", "Inference Time (s)", 4, 2),
