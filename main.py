@@ -321,7 +321,7 @@ class VLLMBenchmark:
         self.tasks = []
 
         logger.info("Warming up...")
-        await asyncio.sleep(30)  # wait for 30 seconds to warm up
+        await asyncio.sleep(10)  # wait for 10 seconds to warm up
         while time.time() < end_time and not self.stop_event.is_set():
             # Check if all requests have been completed - only stop if we're near the end of the duration
             if self._should_stop_early(check_tasks=True):
@@ -345,7 +345,7 @@ class VLLMBenchmark:
             await asyncio.wait(self.tasks)
 
         logger.info("Cooling down...")
-        await asyncio.sleep(30)  # wait for 30 seconds to cool down
+        await asyncio.sleep(10)  # wait for 10 seconds to cool down
 
     def calculate_metrics(self) -> None:
         """Calculate QPS and concurrent requests per second."""
