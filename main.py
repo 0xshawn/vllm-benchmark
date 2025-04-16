@@ -446,8 +446,7 @@ class VLLMBenchmark:
             rows=4,
             cols=2,
             subplot_titles=(
-                "Avg Prompt Tokens/s",
-                "Avg Generation Tokens/s",
+                "Token Processing Rate",
                 "Running Requests",
                 "Pending Requests",
                 "QPS",
@@ -459,14 +458,36 @@ class VLLMBenchmark:
             horizontal_spacing=0.1,
         )
 
-        # Basic metrics
+        # Add combined token metrics
+        fig.add_trace(
+            go.Scatter(
+                x=times,
+                y=self.metrics_data["avg_prompt_tps"],
+                mode="lines+markers",
+                name="Prompt Tokens/s",
+                marker=dict(size=4)
+            ),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=times,
+                y=self.metrics_data["avg_generation_tps"],
+                mode="lines+markers",
+                name="Generation Tokens/s",
+                marker=dict(size=4)
+            ),
+            row=1,
+            col=1,
+        )
+
+        # Rearranged metrics
         metrics = [
-            ("avg_prompt_tps", "Avg Prompt Tokens/s", 1, 1),
-            ("avg_generation_tps", "Avg Generation Tokens/s", 1, 2),
-            ("running_requests", "Running Requests", 2, 1),
-            ("pending_requests", "Pending Requests", 2, 2),
-            ("qps", "QPS", 3, 1),
-            ("concurrent_requests", "Concurrent Requests/s", 3, 2),
+            ("running_requests", "Running Requests", 1, 2),
+            ("pending_requests", "Pending Requests", 2, 1),
+            ("qps", "QPS", 2, 2),
+            ("concurrent_requests", "Concurrent Requests/s", 3, 1),
         ]
 
         for key, title, row, col in metrics:
@@ -492,8 +513,8 @@ class VLLMBenchmark:
                     name="Successful Requests",
                     marker=dict(size=4)
                 ),
-                row=4,
-                col=1,
+                row=3,
+                col=2,
             )
 
         # Add finished request count if available
@@ -509,18 +530,18 @@ class VLLMBenchmark:
                     name="Finished Requests",
                     marker=dict(size=4)
                 ),
-                row=4,
-                col=1,
+                row=3,
+                col=2,
             )
 
         # Add latency metrics if available
         latency_metrics = [
-            ("time_to_first_token", "Time to First Token (s)", 4, 2),
-            ("prefill_time", "Prefill Time (s)", 4, 2),
-            ("decode_time", "Decode Time (s)", 4, 2),
-            ("e2e_latency", "End-to-End Latency (s)", 4, 2),
-            ("queue_time", "Queue Time (s)", 4, 2),
-            ("inference_time", "Inference Time (s)", 4, 2),
+            ("time_to_first_token", "Time to First Token (s)", 4, 1),
+            ("prefill_time", "Prefill Time (s)", 4, 1),
+            ("decode_time", "Decode Time (s)", 4, 1),
+            ("e2e_latency", "End-to-End Latency (s)", 4, 1),
+            ("queue_time", "Queue Time (s)", 4, 1),
+            ("inference_time", "Inference Time (s)", 4, 1),
         ]
 
         for key, name, row, col in latency_metrics:
@@ -550,13 +571,12 @@ class VLLMBenchmark:
 
         # Update y-axis labels and format
         fig.update_yaxes(title_text="Tokens/s", row=1, col=1, tickformat=".1f")
-        fig.update_yaxes(title_text="Tokens/s", row=1, col=2, tickformat=".1f")
+        fig.update_yaxes(title_text="Count", row=1, col=2, tickformat=".1f")
         fig.update_yaxes(title_text="Count", row=2, col=1, tickformat=".1f")
-        fig.update_yaxes(title_text="Count", row=2, col=2, tickformat=".1f")
-        fig.update_yaxes(title_text="Requests/s", row=3, col=1, tickformat=".1f")
+        fig.update_yaxes(title_text="Requests/s", row=2, col=2, tickformat=".1f")
+        fig.update_yaxes(title_text="Count", row=3, col=1, tickformat=".1f")
         fig.update_yaxes(title_text="Count", row=3, col=2, tickformat=".1f")
-        fig.update_yaxes(title_text="Count", row=4, col=1, tickformat=".1f")
-        fig.update_yaxes(title_text="Seconds", row=4, col=2, tickformat=".1f")
+        fig.update_yaxes(title_text="Seconds", row=4, col=1, tickformat=".1f")
 
         # Update x-axis format for all subplots
         for i in range(1, 5):
