@@ -174,6 +174,12 @@ class VLLMBenchmark:
                 else:
                     self.metrics_data["pending_requests"].append(0)
 
+                # Update request success metric
+                if metrics["request_success"] is not None:
+                    self.metrics_data["request_success"].append(metrics["request_success"])
+                else:
+                    self.metrics_data["request_success"].append(0)
+
                 # Update finished request count from client-side counter
                 self.metrics_data["finished_requests"].append(
                     self.finished_request_count
@@ -181,7 +187,9 @@ class VLLMBenchmark:
 
                 # Update time to first token metric
                 if metrics["time_to_first_token"] is not None:
-                    self.metrics_data["time_to_first_token"].append(metrics["time_to_first_token"])
+                    self.metrics_data["time_to_first_token"].append(
+                        metrics["time_to_first_token"]
+                    )
                 else:
                     self.metrics_data["time_to_first_token"].append(0)
 
@@ -192,7 +200,12 @@ class VLLMBenchmark:
                     self.metrics_data["prefill_time"].append(0)
 
                 # Update other latency metrics
-                for metric_name in ["e2e_latency", "queue_time", "inference_time", "decode_time"]:
+                for metric_name in [
+                    "e2e_latency",
+                    "queue_time",
+                    "inference_time",
+                    "decode_time",
+                ]:
                     if metrics[metric_name] is not None:
                         self.metrics_data[metric_name].append(metrics[metric_name])
                     else:
@@ -230,33 +243,56 @@ class VLLMBenchmark:
 
     async def send_request(self) -> None:
         """Send a single request to vLLM API with optional API key authentication."""
-        try:
-            payload = {
-                "model": self.model,
-                "messages": self.payload_config.get(
-                    "messages", [{"role": "user", "content": "Tell me about AI."}]
-                ),
-                "max_tokens": self.payload_config.get("max_tokens", 100),
-            }
-            headers = (
-                {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
-            )
-            async with self.load_session.post(
-                f"{self.vllm_url}/v1/chat/completions", json=payload, headers=headers
-            ) as response:
-                if response.status == 200:
-                    self.request_count += 1
-                    self.finished_request_count += (
-                        1  # Increment finished request counter
-                    )
-                elif response.status == 401:
-                    logger.error("Authentication failed: Invalid or missing API key")
-                else:
-                    logger.error(
-                        f"Request failed: HTTP {response.status}, {await response.text()}"
-                    )
-        except Exception as e:
-            logger.error(f"Request error: {e}")
+        max_retries = 10
+        base_delay = 1.0  # Base delay in seconds
+
+        for retry_count in range(max_retries + 1):
+            try:
+                payload = {
+                    "model": self.model,
+                    "messages": self.payload_config.get(
+                        "messages", [{"role": "user", "content": "Tell me about AI."}]
+                    ),
+                    "max_tokens": self.payload_config.get("max_tokens", 100),
+                }
+                headers = (
+                    {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+                )
+                async with self.load_session.post(
+                    f"{self.vllm_url}/v1/chat/completions",
+                    json=payload,
+                    headers=headers,
+                ) as response:
+                    if response.status == 200:
+                        self.request_count += 1
+                        self.finished_request_count += (
+                            1  # Increment finished request counter
+                        )
+                        return  # Success, exit the retry loop
+                    elif response.status == 401:
+                        logger.error(
+                            "Authentication failed: Invalid or missing API key"
+                        )
+                        return  # Don't retry authentication failures
+                    else:
+                        logger.error(
+                            f"Request failed: HTTP {response.status}, {await response.text()}"
+                        )
+                        # Continue to retry for other HTTP errors
+            except Exception as e:
+                logger.error(f"Request error: {e}")
+                # Continue to retry for exceptions
+
+            # If we've reached here, the request failed and we should retry
+            if retry_count < max_retries:
+                # Calculate delay with exponential backoff
+                delay = base_delay * (2**retry_count)
+                logger.info(
+                    f"Retrying request in {delay:.2f} seconds (attempt {retry_count + 1}/{max_retries})"
+                )
+                await asyncio.sleep(delay)
+            else:
+                logger.error(f"Request failed after {max_retries} retries, giving up")
 
     def _should_stop_early(self, check_tasks: bool = False) -> bool:
         """Check if the benchmark should stop early because all requests are completed.
@@ -451,7 +487,7 @@ class VLLMBenchmark:
                 "Pending Requests",
                 "QPS",
                 "Concurrent Requests/s",
-                "Request Success Rate",
+                "Request Success Count & Finished Requests",
                 "Latency Metrics",
             ),
             vertical_spacing=0.12,
@@ -465,7 +501,7 @@ class VLLMBenchmark:
                 y=self.metrics_data["avg_prompt_tps"],
                 mode="lines+markers",
                 name="Prompt Tokens/s",
-                marker=dict(size=4)
+                marker=dict(size=4),
             ),
             row=1,
             col=1,
@@ -476,7 +512,7 @@ class VLLMBenchmark:
                 y=self.metrics_data["avg_generation_tps"],
                 mode="lines+markers",
                 name="Generation Tokens/s",
-                marker=dict(size=4)
+                marker=dict(size=4),
             ),
             row=1,
             col=1,
@@ -493,14 +529,17 @@ class VLLMBenchmark:
         for key, title, row, col in metrics:
             fig.add_trace(
                 go.Scatter(
-                    x=times, y=self.metrics_data[key], mode="lines+markers", name=title,
-                    marker=dict(size=4)
+                    x=times,
+                    y=self.metrics_data[key],
+                    mode="lines+markers",
+                    name=title,
+                    marker=dict(size=4),
                 ),
                 row=row,
                 col=col,
             )
 
-        # Add request success rate if available
+        # Add request success count and finished requests in the same subplot
         if (
             "request_success" in self.metrics_data
             and self.metrics_data["request_success"]
@@ -510,14 +549,14 @@ class VLLMBenchmark:
                     x=times,
                     y=self.metrics_data["request_success"],
                     mode="lines+markers",
-                    name="Successful Requests",
-                    marker=dict(size=4)
+                    name="Request Success Count",
+                    marker=dict(size=4),
+                    line=dict(color="green"),
                 ),
                 row=3,
                 col=2,
             )
 
-        # Add finished request count if available
         if (
             "finished_requests" in self.metrics_data
             and self.metrics_data["finished_requests"]
@@ -528,7 +567,8 @@ class VLLMBenchmark:
                     y=self.metrics_data["finished_requests"],
                     mode="lines+markers",
                     name="Finished Requests",
-                    marker=dict(size=4)
+                    marker=dict(size=4),
+                    line=dict(color="blue"),
                 ),
                 row=3,
                 col=2,
@@ -552,7 +592,7 @@ class VLLMBenchmark:
                         y=self.metrics_data[key],
                         mode="lines+markers",
                         name=name,
-                        marker=dict(size=4)
+                        marker=dict(size=4),
                     ),
                     row=row,
                     col=col,
