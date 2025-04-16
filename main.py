@@ -68,6 +68,7 @@ class VLLMBenchmark:
         }
         self.request_count = 0
         self.finished_request_count = 0  # Counter for finished requests
+        self.request_success_count = 0  # Counter for successful requests
         self.metrics_session: Optional[aiohttp.ClientSession] = None
         self.load_session: Optional[aiohttp.ClientSession] = None
         self.start_time: Optional[float] = None
@@ -176,7 +177,8 @@ class VLLMBenchmark:
 
                 # Update request success metric
                 if metrics["request_success"] is not None:
-                    self.metrics_data["request_success"].append(metrics["request_success"])
+                    # Use our local counter instead of the value from metrics API
+                    self.metrics_data["request_success"].append(self.request_success_count)
                 else:
                     self.metrics_data["request_success"].append(0)
 
@@ -220,7 +222,7 @@ class VLLMBenchmark:
 
                 # Log additional metrics if available
                 if metrics["request_success"] is not None:
-                    logger.info(f"Successful requests: {metrics['request_success']}")
+                    logger.info(f"Successful requests: {self.request_success_count}")
                 if metrics["time_to_first_token"] is not None:
                     logger.info(
                         f"Time to first token requests: {metrics['time_to_first_token']}"
@@ -265,9 +267,8 @@ class VLLMBenchmark:
                 ) as response:
                     if response.status == 200:
                         self.request_count += 1
-                        self.finished_request_count += (
-                            1  # Increment finished request counter
-                        )
+                        self.finished_request_count += 1  # Increment finished request counter
+                        self.request_success_count += 1  # Increment successful request counter
                         return  # Success, exit the retry loop
                     elif response.status == 401:
                         logger.error(
@@ -397,7 +398,8 @@ class VLLMBenchmark:
             self.metrics_data["request_success"]
             and len(self.metrics_data["request_success"]) > 0
         ):
-            total_requests = self.metrics_data["request_success"][-1]
+            # Use our local counter instead of the value from metrics_data
+            total_requests = self.request_success_count
             qps = total_requests / elapsed if elapsed > 0 else 0
         else:
             # Fallback to request_count if request_success is not available
@@ -413,6 +415,7 @@ class VLLMBenchmark:
         # Log summary metrics
         logger.info(f"Benchmark completed in {elapsed:.2f} seconds")
         logger.info(f"Average QPS: {qps:.2f}")
+        logger.info(f"Total successful requests: {self.request_success_count}")
 
         # Log latency metrics if available
         if (
