@@ -7,7 +7,8 @@ import os
 import time
 from datetime import datetime
 from typing import Dict, List, Optional
-
+import random
+from prompt import SHORT_PROMPTS, LONG_PROMPT_PAIRS
 import aiohttp
 import numpy as np
 import plotly.graph_objs as go
@@ -34,7 +35,7 @@ class VLLMBenchmark:
         concurrency: int,
         api_key: Optional[str],
         model: str,
-        payload_config: Dict,
+        long_context: bool,
     ):
         self.vllm_url = vllm_url.rstrip("/")
         self.metrics_url = metrics_url.rstrip("/")
@@ -47,7 +48,7 @@ class VLLMBenchmark:
                 "No API key provided; requests may fail if authentication is required"
             )
         self.model = model
-        self.payload_config = payload_config
+        self.long_context = long_context
         self.metrics_data: Dict[str, List[float]] = {
             "time": [],
             "avg_prompt_tps": [],
@@ -178,7 +179,9 @@ class VLLMBenchmark:
                 # Update request success metric
                 if metrics["request_success"] is not None:
                     # Use our local counter instead of the value from metrics API
-                    self.metrics_data["request_success"].append(self.request_success_count)
+                    self.metrics_data["request_success"].append(
+                        self.request_success_count
+                    )
                 else:
                     self.metrics_data["request_success"].append(0)
 
@@ -248,18 +251,30 @@ class VLLMBenchmark:
         max_retries = 10
         base_delay = 1.0  # Base delay in seconds
 
+        # Randomly choose content
+        max_tokens = 500
+        if self.long_context:
+            prompt_pair = random.choice(LONG_PROMPT_PAIRS)
+            content = prompt_pair["context"] + "\n\n" + prompt_pair["prompt"]
+            max_tokens = 12800
+        else:
+            content = " ".join(random.choice(SHORT_PROMPTS) * 100).split()[:450]
+
         for retry_count in range(max_retries + 1):
             try:
                 payload = {
                     "model": self.model,
-                    "messages": self.payload_config.get(
-                        "messages", [{"role": "user", "content": "Tell me about AI."}]
-                    ),
-                    "max_tokens": self.payload_config.get("max_tokens", 100),
+                    "messages": [{"role": "user", "content": content}],
+                    "max_tokens": max_tokens,
+                    "stream": True,
                 }
                 headers = (
                     {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
                 )
+                
+                # Record request start time
+                request_start_time = time.time()
+                
                 async with self.load_session.post(
                     f"{self.vllm_url}/v1/chat/completions",
                     json=payload,
@@ -267,8 +282,74 @@ class VLLMBenchmark:
                 ) as response:
                     if response.status == 200:
                         self.request_count += 1
-                        self.finished_request_count += 1  # Increment finished request counter
-                        self.request_success_count += 1  # Increment successful request counter
+                        
+                        # Process streaming response
+                        first_token_time = None
+                        token_count = 0
+                        try:
+                            async for line in response.content:
+                                if line:
+                                    # Skip empty lines
+                                    if line.strip() == b"":
+                                        continue
+                                    
+                                    # Skip the "data: " prefix and parse JSON
+                                    if line.startswith(b"data: "):
+                                        data_str = line[6:].decode('utf-8')
+                                        if data_str.strip() == "[DONE]":
+                                            break
+                                        
+                                        try:
+                                            data = json.loads(data_str)
+                                            # Record time to first token
+                                            if first_token_time is None:
+                                                first_token_time = time.time()
+                                                # Calculate and log time to first token
+                                                time_to_first_token = first_token_time - request_start_time
+                                                logger.info(f"Time to first token: {time_to_first_token:.4f} seconds")
+                                                
+                                                # Store time to first token in metrics data
+                                                current_time = time.time()
+                                                self.metrics_data["time"].append(current_time)
+                                                self.metrics_data["time_to_first_token"].append(time_to_first_token)
+                                            
+                                            # Process the chunk data
+                                            if "choices" in data and len(data["choices"]) > 0:
+                                                choice = data["choices"][0]
+                                                if "delta" in choice and "content" in choice["delta"]:
+                                                    # Count tokens in the content
+                                                    content = choice["delta"]["content"]
+                                                    if content:
+                                                        # Rough estimate: count non-whitespace characters
+                                                        token_count += len([c for c in content if not c.isspace()])
+                                        except json.JSONDecodeError:
+                                            logger.warning(f"Failed to parse JSON from stream: {data_str}")
+                        except Exception as e:
+                            logger.error(f"Error processing stream: {e}")
+                        
+                        # Calculate total request time
+                        request_end_time = time.time()
+                        total_request_time = request_end_time - request_start_time
+                        
+                        # Store end-to-end latency in metrics data
+                        current_time = time.time()
+                        self.metrics_data["time"].append(current_time)
+                        self.metrics_data["e2e_latency"].append(total_request_time)
+                        
+                        # Log request completion metrics
+                        logger.info(f"Request completed in {total_request_time:.4f} seconds")
+                        if token_count > 0:
+                            logger.info(f"Generated approximately {token_count} tokens")
+                        
+                        # Increment counters after successful completion
+                        self.finished_request_count += 1
+                        self.request_success_count += 1
+                        
+                        # Update request success and finished request metrics
+                        self.metrics_data["time"].append(current_time)
+                        self.metrics_data["request_success"].append(self.request_success_count)
+                        self.metrics_data["finished_requests"].append(self.finished_request_count)
+                        
                         return  # Success, exit the retry loop
                     elif response.status == 401:
                         logger.error(
@@ -696,10 +777,9 @@ def parse_args():
         help="Model name for requests (default: phala/deepseek-r1-70b)",
     )
     parser.add_argument(
-        "--payload-config",
-        type=str,
-        default='{"messages": [{"role": "user", "content": "Tell me about AI."}], "max_tokens": 100}',
-        help='JSON string for request payload configuration (default: {"messages": [{"role": "user", "content": "Tell me about AI."}], "max_tokens": 100})',
+        "--long-context",
+        action="store_true",
+        help="Use long context (default: False)",
     )
     return parser.parse_args()
 
@@ -707,12 +787,6 @@ def parse_args():
 def main():
     """Main entry point."""
     args = parse_args()
-    try:
-        payload_config = json.loads(args.payload_config)
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid payload-config JSON: {e}")
-        return
-
     benchmark = VLLMBenchmark(
         vllm_url=args.vllm_url,
         metrics_url=args.metrics_url,
@@ -721,7 +795,7 @@ def main():
         concurrency=args.concurrency,
         api_key=args.api_key,
         model=args.model,
-        payload_config=payload_config,
+        long_context=args.long_context,
     )
 
     asyncio.run(benchmark.run())
