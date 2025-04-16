@@ -472,7 +472,8 @@ class VLLMBenchmark:
         for key, title, row, col in metrics:
             fig.add_trace(
                 go.Scatter(
-                    x=times, y=self.metrics_data[key], mode="lines+markers", name=title
+                    x=times, y=self.metrics_data[key], mode="lines+markers", name=title,
+                    marker=dict(size=4)
                 ),
                 row=row,
                 col=col,
@@ -489,6 +490,7 @@ class VLLMBenchmark:
                     y=self.metrics_data["request_success"],
                     mode="lines+markers",
                     name="Successful Requests",
+                    marker=dict(size=4)
                 ),
                 row=4,
                 col=1,
@@ -505,6 +507,7 @@ class VLLMBenchmark:
                     y=self.metrics_data["finished_requests"],
                     mode="lines+markers",
                     name="Finished Requests",
+                    marker=dict(size=4)
                 ),
                 row=4,
                 col=1,
@@ -528,6 +531,7 @@ class VLLMBenchmark:
                         y=self.metrics_data[key],
                         mode="lines+markers",
                         name=name,
+                        marker=dict(size=4)
                     ),
                     row=row,
                     col=col,
