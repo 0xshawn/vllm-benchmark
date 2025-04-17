@@ -66,6 +66,9 @@ class VLLMBenchmark:
             "prefill_time": [],
             "decode_time": [],
             "finished_requests": [],  # New metric for finished request count
+            # New metrics for first token times and real-time token generation
+            "first_token_times": [],  # List of first token times for each request
+            "realtime_tokens_per_second": [],  # Real-time tokens generated per second
         }
         self.request_count = 0
         self.finished_request_count = 0  # Counter for finished requests
@@ -81,6 +84,12 @@ class VLLMBenchmark:
         self.prev_generation_tokens = 0.0
         self.prev_time: Optional[float] = None
         self.stop_event = asyncio.Event()
+        self.last_chunk_time: Optional[float] = None
+
+        # For tracking tokens across all requests
+        self.tokens_in_current_second = 0
+        self.last_token_second = 0
+        self.token_lock = asyncio.Lock()  # Lock for thread-safe token counting
 
     async def fetch_metrics(self) -> None:
         """Fetch and parse metrics from vLLM /metrics endpoint."""
@@ -226,22 +235,6 @@ class VLLMBenchmark:
                 # Log additional metrics if available
                 if metrics["request_success"] is not None:
                     logger.info(f"Successful requests: {self.request_success_count}")
-                if metrics["time_to_first_token"] is not None:
-                    logger.info(
-                        f"Time to first token requests: {metrics['time_to_first_token']}"
-                    )
-                if metrics["e2e_latency"] is not None:
-                    logger.info(
-                        f"End-to-end latency requests: {metrics['e2e_latency']}"
-                    )
-                if metrics["queue_time"] is not None:
-                    logger.info(f"Queue time requests: {metrics['queue_time']}")
-                if metrics["inference_time"] is not None:
-                    logger.info(f"Inference time requests: {metrics['inference_time']}")
-                if metrics["prefill_time"] is not None:
-                    logger.info(f"Prefill time requests: {metrics['prefill_time']}")
-                if metrics["decode_time"] is not None:
-                    logger.info(f"Decode time requests: {metrics['decode_time']}")
 
         except Exception as e:
             logger.error(f"Error fetching metrics: {e}")
@@ -258,98 +251,156 @@ class VLLMBenchmark:
             content = prompt_pair["context"] + "\n\n" + prompt_pair["prompt"]
             max_tokens = 12800
         else:
-            content = " ".join(random.choice(SHORT_PROMPTS) * 100).split()[:450]
+            content = " ".join((random.choice(SHORT_PROMPTS) * 100).split(" "))[:450]
 
+        logger.info(f"Content length: {len(content)}")
         for retry_count in range(max_retries + 1):
             try:
                 payload = {
                     "model": self.model,
                     "messages": [{"role": "user", "content": content}],
                     "max_tokens": max_tokens,
-                    "stream": True,
+                    "stream": True,  # Enable streaming by default
                 }
                 headers = (
                     {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
                 )
-                
+
                 # Record request start time
                 request_start_time = time.time()
-                
+                first_chunk_received = False
+
                 async with self.load_session.post(
                     f"{self.vllm_url}/v1/chat/completions",
                     json=payload,
                     headers=headers,
                 ) as response:
                     if response.status == 200:
-                        self.request_count += 1
-                        
                         # Process streaming response
-                        first_token_time = None
-                        token_count = 0
-                        try:
-                            async for line in response.content:
-                                if line:
-                                    # Skip empty lines
-                                    if line.strip() == b"":
-                                        continue
-                                    
+                        async for line in response.content:
+                            if line:
+                                try:
                                     # Skip the "data: " prefix and parse JSON
-                                    if line.startswith(b"data: "):
-                                        data_str = line[6:].decode('utf-8')
-                                        if data_str.strip() == "[DONE]":
-                                            break
-                                        
-                                        try:
-                                            data = json.loads(data_str)
-                                            # Record time to first token
-                                            if first_token_time is None:
-                                                first_token_time = time.time()
-                                                # Calculate and log time to first token
-                                                time_to_first_token = first_token_time - request_start_time
-                                                logger.info(f"Time to first token: {time_to_first_token:.4f} seconds")
-                                                
-                                                # Store time to first token in metrics data
-                                                current_time = time.time()
-                                                self.metrics_data["time"].append(current_time)
-                                                self.metrics_data["time_to_first_token"].append(time_to_first_token)
-                                            
-                                            # Process the chunk data
-                                            if "choices" in data and len(data["choices"]) > 0:
-                                                choice = data["choices"][0]
-                                                if "delta" in choice and "content" in choice["delta"]:
-                                                    # Count tokens in the content
-                                                    content = choice["delta"]["content"]
-                                                    if content:
-                                                        # Rough estimate: count non-whitespace characters
-                                                        token_count += len([c for c in content if not c.isspace()])
-                                        except json.JSONDecodeError:
-                                            logger.warning(f"Failed to parse JSON from stream: {data_str}")
-                        except Exception as e:
-                            logger.error(f"Error processing stream: {e}")
-                        
-                        # Calculate total request time
-                        request_end_time = time.time()
-                        total_request_time = request_end_time - request_start_time
-                        
-                        # Store end-to-end latency in metrics data
-                        current_time = time.time()
-                        self.metrics_data["time"].append(current_time)
-                        self.metrics_data["e2e_latency"].append(total_request_time)
-                        
-                        # Log request completion metrics
-                        logger.info(f"Request completed in {total_request_time:.4f} seconds")
-                        if token_count > 0:
-                            logger.info(f"Generated approximately {token_count} tokens")
-                        
-                        # Increment counters after successful completion
-                        self.finished_request_count += 1
-                        self.request_success_count += 1
-                        
-                        # Update request success and finished request metrics
-                        self.metrics_data["time"].append(current_time)
-                        self.metrics_data["request_success"].append(self.request_success_count)
-                        self.metrics_data["finished_requests"].append(self.finished_request_count)
-                        
+                                    line_text = line.decode("utf-8").strip()
+                                    if line_text.startswith("data: "):
+                                        json_str = line_text[
+                                            6:
+                                        ]  # Remove "data: " prefix
+                                        if json_str == "[DONE]":
+                                            break  # End of stream
+
+                                        chunk = json.loads(json_str)
+                                        # Calculate timing metrics from first chunk
+                                        if not first_chunk_received:
+                                            first_chunk_time = time.time()
+                                            prefill_time = (
+                                                first_chunk_time - request_start_time
+                                            )
+
+                                            # Store the prefill time
+                                            self.metrics_data["prefill_time"].append(
+                                                prefill_time
+                                            )
+
+                                            # Store the first token time
+                                            self.metrics_data[
+                                                "first_token_times"
+                                            ].append(first_chunk_time - self.start_time)
+
+                                            first_chunk_received = True
+
+                                            # For decode time, we'll use the time between first chunk and second chunk
+                                            # This will be updated when we receive the second chunk
+                                            self.last_chunk_time = first_chunk_time
+                                        else:
+                                            # Calculate decode time from second chunk onwards
+                                            current_chunk_time = time.time()
+                                            decode_time = (
+                                                current_chunk_time
+                                                - self.last_chunk_time
+                                            )
+
+                                            # Store the decode time
+                                            self.metrics_data["decode_time"].append(
+                                                decode_time
+                                            )
+
+                                            self.last_chunk_time = current_chunk_time
+
+                                        # Track tokens received and calculate real-time tokens per second
+                                        if (
+                                            "choices" in chunk
+                                            and len(chunk["choices"]) > 0
+                                        ):
+                                            if (
+                                                "delta" in chunk["choices"][0]
+                                                and "content"
+                                                in chunk["choices"][0]["delta"]
+                                            ):
+                                                content = chunk["choices"][0]["delta"][
+                                                    "content"
+                                                ]
+                                                if content:
+                                                    # Approximate token count (rough estimate)
+                                                    new_tokens = len(content.split())
+
+                                                    # Use a lock to safely update the shared token counter
+                                                    async with self.token_lock:
+                                                        current_time = time.time()
+                                                        current_second = int(
+                                                            current_time
+                                                        )
+
+                                                        # If we're in a new second, record the previous second's data and reset
+                                                        if (
+                                                            current_second
+                                                            > self.last_token_second
+                                                        ):
+                                                            # Record the previous second's token count
+                                                            if (
+                                                                self.last_token_second
+                                                                > 0
+                                                            ):  # Skip the first second (0)
+                                                                self.metrics_data[
+                                                                    "realtime_tokens_per_second"
+                                                                ].append(
+                                                                    self.tokens_in_current_second
+                                                                )
+                                                                self.metrics_data[
+                                                                    "time"
+                                                                ].append(
+                                                                    self.last_token_second
+                                                                )
+
+                                                            # Reset for the new second
+                                                            self.tokens_in_current_second = (
+                                                                0
+                                                            )
+                                                            self.last_token_second = (
+                                                                current_second
+                                                            )
+
+                                                        # Add tokens to the current second's counter
+                                                        self.tokens_in_current_second += (
+                                                            new_tokens
+                                                        )
+
+                                except json.JSONDecodeError:
+                                    logger.warning(
+                                        f"Failed to parse JSON from stream: {line_text}"
+                                    )
+                                except Exception as e:
+                                    logger.warning(
+                                        f"Error processing stream chunk: {e}"
+                                    )
+
+                        self.request_count += 1
+                        self.finished_request_count += (
+                            1  # Increment finished request counter
+                        )
+                        self.request_success_count += (
+                            1  # Increment successful request counter
+                        )
                         return  # Success, exit the retry loop
                     elif response.status == 401:
                         logger.error(
@@ -439,7 +490,7 @@ class VLLMBenchmark:
         self.tasks = []
 
         logger.info("Warming up...")
-        await asyncio.sleep(10)  # wait for 10 seconds to warm up
+        await asyncio.sleep(0)  # wait for 10 seconds to warm up
         while time.time() < end_time and not self.stop_event.is_set():
             # Check if all requests have been completed - only stop if we're near the end of the duration
             if self._should_stop_early(check_tasks=True):
@@ -487,11 +538,21 @@ class VLLMBenchmark:
             qps = self.request_count / elapsed if elapsed > 0 else 0
 
         # Calculate average QPS for each time point
-        for _ in range(len(times)):
+        for i in range(len(times)):
             self.metrics_data["qps"].append(qps)
-            self.metrics_data["concurrent_requests"].append(
-                self.metrics_data["running_requests"][_]
-            )
+            # Make sure we don't access an index that doesn't exist
+            if i < len(self.metrics_data["running_requests"]):
+                self.metrics_data["concurrent_requests"].append(
+                    self.metrics_data["running_requests"][i]
+                )
+            else:
+                # If the index doesn't exist, use the last available value or 0
+                last_value = (
+                    self.metrics_data["running_requests"][-1]
+                    if self.metrics_data["running_requests"]
+                    else 0
+                )
+                self.metrics_data["concurrent_requests"].append(last_value)
 
         # Log summary metrics
         logger.info(f"Benchmark completed in {elapsed:.2f} seconds")
@@ -563,7 +624,7 @@ class VLLMBenchmark:
 
         # Create a more comprehensive visualization with additional metrics
         fig = make_subplots(
-            rows=4,
+            rows=5,  # Increased from 4 to 5 rows
             cols=2,
             subplot_titles=(
                 "Token Processing Rate",
@@ -573,6 +634,8 @@ class VLLMBenchmark:
                 "Concurrent Requests/s",
                 "Request Success Count & Finished Requests",
                 "Latency Metrics",
+                "First Token Times",
+                "Real-time Tokens per Second",
             ),
             vertical_spacing=0.12,
             horizontal_spacing=0.1,
@@ -585,7 +648,7 @@ class VLLMBenchmark:
                 y=self.metrics_data["avg_prompt_tps"],
                 mode="lines+markers",
                 name="Prompt Tokens/s",
-                marker=dict(size=4),
+                marker=dict(size=2),
             ),
             row=1,
             col=1,
@@ -596,7 +659,7 @@ class VLLMBenchmark:
                 y=self.metrics_data["avg_generation_tps"],
                 mode="lines+markers",
                 name="Generation Tokens/s",
-                marker=dict(size=4),
+                marker=dict(size=2),
             ),
             row=1,
             col=1,
@@ -617,7 +680,7 @@ class VLLMBenchmark:
                     y=self.metrics_data[key],
                     mode="lines+markers",
                     name=title,
-                    marker=dict(size=4),
+                    marker=dict(size=2),
                 ),
                 row=row,
                 col=col,
@@ -634,7 +697,7 @@ class VLLMBenchmark:
                     y=self.metrics_data["request_success"],
                     mode="lines+markers",
                     name="Request Success Count",
-                    marker=dict(size=4),
+                    marker=dict(size=2),
                     line=dict(color="green"),
                 ),
                 row=3,
@@ -651,7 +714,7 @@ class VLLMBenchmark:
                     y=self.metrics_data["finished_requests"],
                     mode="lines+markers",
                     name="Finished Requests",
-                    marker=dict(size=4),
+                    marker=dict(size=2),
                     line=dict(color="blue"),
                 ),
                 row=3,
@@ -676,17 +739,55 @@ class VLLMBenchmark:
                         y=self.metrics_data[key],
                         mode="lines+markers",
                         name=name,
-                        marker=dict(size=4),
+                        marker=dict(size=2),
                     ),
                     row=row,
                     col=col,
                 )
 
+        # Add first token times scatter plot
+        if (
+            "first_token_times" in self.metrics_data
+            and self.metrics_data["first_token_times"]
+        ):
+            # Create x-axis values (request indices)
+            request_indices = list(range(len(self.metrics_data["first_token_times"])))
+
+            fig.add_trace(
+                go.Scatter(
+                    x=request_indices,
+                    y=self.metrics_data["first_token_times"],
+                    mode="lines+markers",
+                    name="First Token Times",
+                    marker=dict(size=2, color="red"),
+                ),
+                row=4,
+                col=2,
+            )
+
+        # Add real-time tokens per second
+        if (
+            "realtime_tokens_per_second" in self.metrics_data
+            and self.metrics_data["realtime_tokens_per_second"]
+        ):
+            fig.add_trace(
+                go.Scatter(
+                    x=times,
+                    y=self.metrics_data["realtime_tokens_per_second"],
+                    mode="lines+markers",
+                    name="Real-time Tokens/s",
+                    marker=dict(size=2),
+                    line=dict(color="purple"),
+                ),
+                row=5,
+                col=1,
+            )
+
         # Update layout
         fig.update_layout(
             title_text="vLLM Benchmark Results",
             showlegend=True,
-            height=1200,
+            height=1500,  # Increased height to accommodate new plots
             width=1400,
             legend=dict(
                 orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1
@@ -701,9 +802,11 @@ class VLLMBenchmark:
         fig.update_yaxes(title_text="Count", row=3, col=1, tickformat=".1f")
         fig.update_yaxes(title_text="Count", row=3, col=2, tickformat=".1f")
         fig.update_yaxes(title_text="Seconds", row=4, col=1, tickformat=".1f")
+        fig.update_yaxes(title_text="Seconds", row=4, col=2, tickformat=".1f")
+        fig.update_yaxes(title_text="Tokens/s", row=5, col=1, tickformat=".1f")
 
         # Update x-axis format for all subplots
-        for i in range(1, 5):
+        for i in range(1, 6):  # Updated to include the new row
             for j in range(1, 3):
                 fig.update_xaxes(tickformat=".1f", row=i, col=j)
 
