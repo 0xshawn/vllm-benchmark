@@ -272,7 +272,7 @@ class VLLMBenchmark:
                     f"{self.vllm_url}/v1/chat/completions",
                     json=payload,
                     headers=headers,
-                    timeout=600,  # 10 minutes timeout
+                    timeout=30 * 60,  # 30 minutes timeout
                 ) as response:
                     if response.status == 200:
                         # Process streaming response
