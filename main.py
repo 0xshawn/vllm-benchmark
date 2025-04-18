@@ -255,9 +255,6 @@ class VLLMBenchmark:
 
     async def send_request(self, request_id: int) -> None:
         """Send a single request to vLLM API with optional API key authentication."""
-        delay = 1
-        max_delay = 10
-
         # Randomly choose content
         max_tokens = 1000
         if self.long_context:
@@ -427,12 +424,7 @@ class VLLMBenchmark:
                 _request_error_count += 1
 
             # If we've reached here, the request failed and we should retry
-            delay += 1
-            if delay > max_delay:
-                delay = max_delay
-            logger.info(f"Retrying request in {delay} seconds")
-            _request_retry_count += 1
-            await asyncio.sleep(delay)
+            await asyncio.sleep(random.randint(0, 10))
 
         # Write request metrics to records
         # request_id, request_cost, prefill_cost, decode_cost, prompt_tokens, generation_tokens, request_retry_count, 429_count, 400_count, request_error_count
