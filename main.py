@@ -26,6 +26,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def get_timestamp():
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
 class VLLMBenchmark:
     """A tool to benchmark vLLM service performance."""
 
@@ -94,6 +98,16 @@ class VLLMBenchmark:
         self.stream_tokens_lock: asyncio.Lock = asyncio.Lock()
 
         self.generate_load_done = False
+
+        # For recording requests
+        self.records_file = open(
+            os.path.join(self.output_dir, f"records_{get_timestamp()}.csv"),
+            "w",
+            encoding="utf-8",
+        )
+        self.records_file.write(
+            "request_id,request_cost,prefill_cost,decode_cost,prompt_tokens,generation_tokens,request_retry_count,429_count,400_count,request_error_count\n"
+        )
 
     async def fetch_metrics(self) -> None:
         """Fetch and parse metrics from vLLM /metrics endpoint."""
@@ -239,7 +253,7 @@ class VLLMBenchmark:
         except Exception as e:
             logger.error(f"Error fetching metrics: {e}")
 
-    async def send_request(self) -> None:
+    async def send_request(self, request_id: int) -> None:
         """Send a single request to vLLM API with optional API key authentication."""
         delay = 1
         max_delay = 10
@@ -261,13 +275,26 @@ class VLLMBenchmark:
             "stream_options": {"include_usage": True},
         }
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+
+        # Metrics
         _start_time = time.time()
+        _request_start_time = 0
+        _request_finish_time = 0
+        _prefill_finish_time = 0
+        _429_count = 0
+        _400_count = 0
+        _request_error_count = 0
+        _request_retry_count = 0
+        _prompt_tokens_count = 0
+        _generation_tokens_count = 0
+
         while True:
             try:
                 # Record request start time
                 request_start_time = time.time()
                 first_chunk_received = False
 
+                _request_start_time = time.time()
                 async with self.load_session.post(
                     f"{self.vllm_url}/v1/chat/completions",
                     json=payload,
@@ -286,6 +313,11 @@ class VLLMBenchmark:
 
                                     json_str = line_text[6:]  # Remove "data: " prefix
                                     if json_str == "[DONE]":
+                                        _request_finish_time = time.time()
+                                        _generation_tokens_count = (
+                                            _prompt_tokens_count
+                                            + _generation_tokens_count
+                                        )
                                         break  # End of stream
 
                                     chunk = json.loads(json_str)
@@ -307,6 +339,7 @@ class VLLMBenchmark:
                                         )
 
                                         first_chunk_received = True
+                                        _prefill_finish_time = first_chunk_time
 
                                         # For decode time, we'll use the time between first chunk and second chunk
                                         # This will be updated when we receive the second chunk
@@ -324,6 +357,17 @@ class VLLMBenchmark:
                                         )
 
                                         self.last_chunk_time = current_chunk_time
+
+                                    # Parse usage
+                                    if "usage" in chunk:
+                                        _prompt_tokens_count = (
+                                            chunk["usage"].get("prompt_tokens", 0)
+                                            or _prompt_tokens_count
+                                        )
+                                        _generation_tokens_count = (
+                                            chunk["usage"].get("completion_tokens", 0)
+                                            or _generation_tokens_count
+                                        )
 
                                     # Track tokens received and calculate real-time tokens per second
                                     if "choices" in chunk and len(chunk["choices"]) > 0:
@@ -357,16 +401,18 @@ class VLLMBenchmark:
                         self.request_count += 1
                         self.finished_request_count += 1
                         self.request_success_count += 1
-                        return
+                        break
                     if response.status == 429:
-                        # Just retry
-                        continue
+                        _429_count += 1
+                    elif response.status == 400:
+                        _400_count += 1
                     elif response.status == 401:
                         logger.error(
                             "Authentication failed: Invalid or missing API key"
                         )
-                        return  # Don't retry authentication failures
+                        break
                     else:
+                        _request_error_count += 1
                         logger.error(
                             f"Request failed: HTTP {response.status}, {await response.text()} at {time.time() - _start_time:.2f} seconds"
                         )
@@ -378,13 +424,21 @@ class VLLMBenchmark:
                     f"Request error: {error_type}: {error_msg}, at {(time.time() - _start_time):.2f} seconds"
                 )
                 logger.error(traceback.format_exc())
+                _request_error_count += 1
 
             # If we've reached here, the request failed and we should retry
             delay += 1
             if delay > max_delay:
                 delay = max_delay
             logger.info(f"Retrying request in {delay} seconds")
+            _request_retry_count += 1
             await asyncio.sleep(delay)
+
+        # Write request metrics to records
+        # request_id, request_cost, prefill_cost, decode_cost, prompt_tokens, generation_tokens, request_retry_count, 429_count, 400_count, request_error_count
+        self.records_file.write(
+            f"{request_id},{int(_request_finish_time - _request_start_time)},{int(_prefill_finish_time - _request_start_time)},{int(_request_finish_time - _prefill_finish_time)},{_prompt_tokens_count},{_generation_tokens_count},{_request_retry_count},{_429_count},{_400_count},{_request_error_count}\n"
+        )
 
     def _should_stop_early(self, check_tasks: bool = False) -> bool:
         """Check if the benchmark should stop early because all requests are completed or finished requests exceed concurrency.
@@ -481,6 +535,7 @@ class VLLMBenchmark:
         self.tasks = []
 
         logger.info("Generating load...")
+        _request_id = 0
         while time.time() < end_time and not self.stop_event.is_set():
             if self._should_stop_early(check_tasks=True):
                 logger.info(
@@ -490,7 +545,8 @@ class VLLMBenchmark:
                 break
 
             if len(self.tasks) < self.concurrency:
-                self.tasks.append(asyncio.create_task(self.send_request()))
+                self.tasks.append(asyncio.create_task(self.send_request(_request_id)))
+                _request_id += 1
                 if interval > 0:
                     await asyncio.sleep(interval)
             else:
@@ -742,8 +798,9 @@ class VLLMBenchmark:
             for j in range(1, 3):
                 fig.update_xaxes(tickformat=".1f", row=i, col=j)
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = os.path.join(self.output_dir, f"vllm_benchmark_{timestamp}.html")
+        output_file = os.path.join(
+            self.output_dir, f"vllm_benchmark_{get_timestamp()}.html"
+        )
         fig.write_html(output_file)
         logger.info(f"Benchmark results saved to {output_file}")
 
