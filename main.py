@@ -25,47 +25,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def calculate_metrics_of_tokens(
-    tokens: List[Dict[int, int]],
-    max_seconds: int,
-) -> Tuple[List[int], List[int]]:
-    """Calculate metrics for tokens generated in real-time.
-
-    Args:
-        tokens: List of dictionaries containing time and token count for each chunk.
-               Each dict has format: {"time": seconds_since_start, "tokens": token_count}
-
-    Returns:
-        Tuple containing:
-        - List of seconds (x-axis values)
-        - List of token counts per second (y-axis values)
-    """
-    if not tokens:
-        return [], []
-
-    # Get the time range
-    start_time = 0
-    end_time = max_seconds
-
-    # Create a dictionary to store token counts for each second
-    tokens_per_second = {}
-    cumulative_tokens = 0
-
-    # Sum tokens for each second
-    for token_data in tokens:
-        second = token_data["time"]
-        if second not in tokens_per_second:
-            tokens_per_second[second] = 0
-        tokens_per_second[second] += token_data["tokens"]
-        cumulative_tokens += token_data["tokens"]
-
-    # Create lists for plotting
-    seconds = list(range(start_time, end_time + 1))
-    tokens_per_second_list = [tokens_per_second.get(second, 0) for second in seconds]
-
-    return seconds, tokens_per_second_list
-
-
 class VLLMBenchmark:
     """A tool to benchmark vLLM service performance."""
 
@@ -132,6 +91,8 @@ class VLLMBenchmark:
         # For tracking tokens across all requests
         self.stream_tokens_count: int = 0
         self.stream_tokens_lock: asyncio.Lock = asyncio.Lock()
+
+        self.generate_load_done = False
 
     async def fetch_metrics(self) -> None:
         """Fetch and parse metrics from vLLM /metrics endpoint."""
@@ -283,7 +244,7 @@ class VLLMBenchmark:
         max_delay = 10
 
         # Randomly choose content
-        max_tokens = 500
+        max_tokens = 1000
         if self.long_context:
             prompt_pair = random.choice(LONG_PROMPT_PAIRS)
             content = prompt_pair["context"] + "\n\n" + prompt_pair["prompt"]
@@ -296,6 +257,7 @@ class VLLMBenchmark:
             "messages": [{"role": "user", "content": content}],
             "max_tokens": max_tokens,
             "stream": True,  # Enable streaming by default
+            "stream_options": {"include_usage": True},
         }
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         while True:
@@ -363,14 +325,17 @@ class VLLMBenchmark:
 
                                     # Track tokens received and calculate real-time tokens per second
                                     if "choices" in chunk and len(chunk["choices"]) > 0:
-                                        if (
-                                            "delta" in chunk["choices"][0]
-                                            and "content"
+                                        if "delta" in chunk["choices"][0] and (
+                                            "content" in chunk["choices"][0]["delta"]
+                                            or "reasoning_content"
                                             in chunk["choices"][0]["delta"]
                                         ):
-                                            content = chunk["choices"][0]["delta"][
-                                                "content"
-                                            ]
+                                            content = chunk["choices"][0]["delta"].get(
+                                                "content",
+                                                chunk["choices"][0]["delta"].get(
+                                                    "reasoning_content"
+                                                ),
+                                            )
                                             if content:
                                                 # Approximate token count (rough estimate)
                                                 new_tokens = len(content.split())
@@ -416,7 +381,7 @@ class VLLMBenchmark:
             await asyncio.sleep(delay)
 
     def _should_stop_early(self, check_tasks: bool = False) -> bool:
-        """Check if the benchmark should stop early because all requests are completed.
+        """Check if the benchmark should stop early because all requests are completed or finished requests exceed concurrency.
 
         Args:
             check_tasks: If True, also check if there are no pending tasks.
@@ -424,11 +389,23 @@ class VLLMBenchmark:
         Returns:
             bool: True if the benchmark should stop early, False otherwise.
         """
-        # Only check after 60 seconds
+        # Only check after 60 seconds to allow metrics to stabilize
         if time.time() - self.start_time <= 60:
             return False
 
-        # Check if all requests are completed
+        # Stop if finished requests exceed concurrency limit
+        if self.finished_request_count >= self.concurrency:
+            if self.finish_time is None:
+                self.finish_time = time.time()
+                logger.info(
+                    f"Finished requests ({self.finished_request_count}) reached or exceeded concurrency limit ({self.concurrency}) at {self.finish_time:.2f} seconds"
+                )
+                logger.info(
+                    f"Total time to complete all requests: {self.finish_time - self.start_time:.2f} seconds"
+                )
+            return True
+
+        # Existing conditions for early stopping
         if not self.metrics_data["running_requests"]:
             return False
         if (
@@ -453,11 +430,7 @@ class VLLMBenchmark:
 
     async def monitor_metrics(self) -> None:
         """Periodically fetch metrics during the benchmark."""
-        _log_time = time.time()
-        while (
-            time.time() - self.start_time < self.duration
-            and not self.stop_event.is_set()
-        ):
+        while time.time() - self.start_time < self.duration:
             start_time = time.time()
             await self.fetch_metrics()
             time_cost = time.time() - start_time
@@ -466,12 +439,7 @@ class VLLMBenchmark:
             else:
                 await asyncio.sleep(1)
 
-            # Check if all requests have been completed - only stop if we're near the end of the duration
-            if self._should_stop_early():
-                logger.info(
-                    "All requests have been completed. Stopping benchmark early."
-                )
-                self.stop_event.set()
+            if self.generate_load_done:
                 break
 
     async def handle_stream_tokens(self) -> None:
@@ -485,11 +453,7 @@ class VLLMBenchmark:
     async def scheduled_tasks(self) -> None:
         """Periodically run scheduled tasks during the benchmark."""
         _log_time = time.time()
-        while (
-            time.time() - self.start_time < self.duration
-            and not self.stop_event.is_set()
-        ):
-
+        while time.time() - self.start_time < self.duration:
             if time.time() - _log_time > 10:
                 _log_time = time.time()
                 logger.info(f"Stream tokens count: {self.stream_tokens_count}")
@@ -500,9 +464,8 @@ class VLLMBenchmark:
 
             await asyncio.sleep(1)
 
-            # Stop the scheduled tasks if all requests have been completed
-            if self._should_stop_early():
-                self.stop_event.set()
+            # Stop if self.generate_load() is done
+            if self.generate_load_done:
                 break
 
     async def generate_load(self) -> None:
@@ -512,9 +475,7 @@ class VLLMBenchmark:
         self.tasks = []
 
         logger.info("Generating load...")
-        _log_time = time.time()
         while time.time() < end_time and not self.stop_event.is_set():
-            # Check if all requests have been completed - only stop if we're near the end of the duration
             if self._should_stop_early(check_tasks=True):
                 logger.info(
                     "All requests have been completed. Stopping load generation early."
@@ -533,10 +494,12 @@ class VLLMBenchmark:
                 self.tasks = list(pending) + [t for t in done if not t.exception()]
 
         if self.tasks:
+            logger.warning(f"Waiting for {len(self.tasks)} tasks to complete")
             await asyncio.wait(self.tasks)
 
         logger.info("Cooling down...")
         await asyncio.sleep(10)  # wait for 10 seconds to cool down
+        self.generate_load_done = True
 
     def calculate_metrics(self) -> None:
         """Calculate QPS and concurrent requests per second."""
