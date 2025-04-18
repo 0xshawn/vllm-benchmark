@@ -6,6 +6,7 @@ import logging
 import os
 import random
 import time
+import traceback
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -260,6 +261,7 @@ class VLLMBenchmark:
             "stream_options": {"include_usage": True},
         }
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        _start_time = time.time()
         while True:
             try:
                 # Record request start time
@@ -366,12 +368,16 @@ class VLLMBenchmark:
                         return  # Don't retry authentication failures
                     else:
                         logger.error(
-                            f"Request failed: HTTP {response.status}, {await response.text()}"
+                            f"Request failed: HTTP {response.status}, {await response.text()} at {time.time() - _start_time:.2f} seconds"
                         )
-                        # Continue to retry for other HTTP errors
             except Exception as e:
-                logger.error(f"Request error: {e}")
-                # Continue to retry for exceptions
+                # Log detailed exception information
+                error_type = type(e).__name__
+                error_msg = str(e)
+                logger.error(
+                    f"Request error: {error_type}: {error_msg}, at {(time.time() - _start_time):.2f} seconds"
+                )
+                logger.error(traceback.format_exc())
 
             # If we've reached here, the request failed and we should retry
             delay += 1
