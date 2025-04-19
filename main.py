@@ -260,7 +260,7 @@ class VLLMBenchmark:
         if self.long_context:
             prompt_pair = random.choice(LONG_PROMPT_PAIRS)
             content = prompt_pair["context"] + "\n\n" + prompt_pair["prompt"]
-            max_tokens = 12800
+            max_tokens = 9000
         else:
             content = " ".join((random.choice(SHORT_PROMPTS) * 100).split(" "))[:450]
 
