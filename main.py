@@ -81,7 +81,6 @@ class VLLMBenchmark:
         self.finished_request_count = 0  # Counter for finished requests
         self.request_success_count = 0  # Counter for successful requests
         self.metrics_session: Optional[aiohttp.ClientSession] = None
-        self.load_session: Optional[aiohttp.ClientSession] = None
         self.start_time: Optional[float] = None
         self.finish_time: Optional[float] = None
         self.output_dir = "benchmark_results"
@@ -292,127 +291,129 @@ class VLLMBenchmark:
                 first_chunk_received = False
 
                 _request_start_time = time.time()
-                async with self.load_session.post(
-                    f"{self.vllm_url}/v1/chat/completions",
-                    json=payload,
-                    headers=headers,
-                    timeout=3 * 60 * 60,  # 3 hours timeout
-                ) as response:
-                    if response.status == 200:
-                        # Process streaming response
-                        async for line in response.content:
-                            if line:
-                                try:
-                                    # Skip the "data: " prefix and parse JSON
-                                    line_text = line.decode("utf-8").strip()
-                                    if not line_text.startswith("data: "):
-                                        continue
+                # Create a new session for each request
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{self.vllm_url}/v1/chat/completions",
+                        json=payload,
+                        headers=headers,
+                        timeout=3 * 60 * 60,  # 3 hours timeout
+                    ) as response:
+                        if response.status == 200:
+                            # Process streaming response
+                            async for line in response.content:
+                                if line:
+                                    try:
+                                        # Skip the "data: " prefix and parse JSON
+                                        line_text = line.decode("utf-8").strip()
+                                        if not line_text.startswith("data: "):
+                                            continue
 
-                                    json_str = line_text[6:]  # Remove "data: " prefix
-                                    if json_str == "[DONE]":
-                                        _request_finish_time = time.time()
-                                        _generation_tokens_count = (
-                                            _prompt_tokens_count
-                                            + _generation_tokens_count
-                                        )
-                                        break  # End of stream
-
-                                    chunk = json.loads(json_str)
-                                    # Calculate timing metrics from first chunk
-                                    if not first_chunk_received:
-                                        first_chunk_time = time.time()
-                                        prefill_time = (
-                                            first_chunk_time - request_start_time
-                                        )
-
-                                        # Store the prefill time
-                                        self.metrics_data["prefill_time"].append(
-                                            prefill_time
-                                        )
-
-                                        # Store the first token time
-                                        self.metrics_data["first_token_times"].append(
-                                            first_chunk_time - self.start_time
-                                        )
-
-                                        first_chunk_received = True
-                                        _prefill_finish_time = first_chunk_time
-
-                                        # For decode time, we'll use the time between first chunk and second chunk
-                                        # This will be updated when we receive the second chunk
-                                        self.last_chunk_time = first_chunk_time
-                                    else:
-                                        # Calculate decode time from second chunk onwards
-                                        current_chunk_time = time.time()
-                                        decode_time = (
-                                            current_chunk_time - self.last_chunk_time
-                                        )
-
-                                        # Store the decode time
-                                        self.metrics_data["decode_time"].append(
-                                            decode_time
-                                        )
-
-                                        self.last_chunk_time = current_chunk_time
-
-                                    # Parse usage
-                                    if "usage" in chunk:
-                                        _prompt_tokens_count = (
-                                            chunk["usage"].get("prompt_tokens", 0)
-                                            or _prompt_tokens_count
-                                        )
-                                        _generation_tokens_count = (
-                                            chunk["usage"].get("completion_tokens", 0)
-                                            or _generation_tokens_count
-                                        )
-
-                                    # Track tokens received and calculate real-time tokens per second
-                                    if "choices" in chunk and len(chunk["choices"]) > 0:
-                                        if "delta" in chunk["choices"][0] and (
-                                            "content" in chunk["choices"][0]["delta"]
-                                            or "reasoning_content"
-                                            in chunk["choices"][0]["delta"]
-                                        ):
-                                            content = chunk["choices"][0]["delta"].get(
-                                                "content",
-                                                chunk["choices"][0]["delta"].get(
-                                                    "reasoning_content"
-                                                ),
+                                        json_str = line_text[6:]  # Remove "data: " prefix
+                                        if json_str == "[DONE]":
+                                            _request_finish_time = time.time()
+                                            _generation_tokens_count = (
+                                                _prompt_tokens_count
+                                                + _generation_tokens_count
                                             )
-                                            if content:
-                                                # Approximate token count (rough estimate)
-                                                new_tokens = len(content.split())
-                                                async with self.stream_tokens_lock:
-                                                    self.stream_tokens_count += (
-                                                        new_tokens
-                                                    )
-                                except json.JSONDecodeError:
-                                    logger.warning(
-                                        f"Failed to parse JSON from stream: {line_text}"
-                                    )
-                                except Exception as e:
-                                    logger.warning(
-                                        f"Error processing stream chunk: {e}"
-                                    )
+                                            break  # End of stream
 
-                        self.request_count += 1
-                        self.finished_request_count += 1
-                        self.request_success_count += 1
-                        break
-                    if response.status == 429:
-                        _429_count += 1
-                    elif response.status == 400:
-                        _400_count += 1
-                    elif response.status == 401:
-                        logger.error(
-                            "Authentication failed: Invalid or missing API key"
-                        )
-                        break
-                    else:
-                        _request_error_count += 1
-                        logger.error(
-                            f"Request failed: HTTP {response.status}, {await response.text()} at {time.time() - _start_time:.2f} seconds"
-                        )
+                                        chunk = json.loads(json_str)
+                                        # Calculate timing metrics from first chunk
+                                        if not first_chunk_received:
+                                            first_chunk_time = time.time()
+                                            prefill_time = (
+                                                first_chunk_time - request_start_time
+                                            )
+
+                                            # Store the prefill time
+                                            self.metrics_data["prefill_time"].append(
+                                                prefill_time
+                                            )
+
+                                            # Store the first token time
+                                            self.metrics_data["first_token_times"].append(
+                                                first_chunk_time - self.start_time
+                                            )
+
+                                            first_chunk_received = True
+                                            _prefill_finish_time = first_chunk_time
+
+                                            # For decode time, we'll use the time between first chunk and second chunk
+                                            # This will be updated when we receive the second chunk
+                                            self.last_chunk_time = first_chunk_time
+                                        else:
+                                            # Calculate decode time from second chunk onwards
+                                            current_chunk_time = time.time()
+                                            decode_time = (
+                                                current_chunk_time - self.last_chunk_time
+                                            )
+
+                                            # Store the decode time
+                                            self.metrics_data["decode_time"].append(
+                                                decode_time
+                                            )
+
+                                            self.last_chunk_time = current_chunk_time
+
+                                        # Parse usage
+                                        if "usage" in chunk:
+                                            _prompt_tokens_count = (
+                                                chunk["usage"].get("prompt_tokens", 0)
+                                                or _prompt_tokens_count
+                                            )
+                                            _generation_tokens_count = (
+                                                chunk["usage"].get("completion_tokens", 0)
+                                                or _generation_tokens_count
+                                            )
+
+                                        # Track tokens received and calculate real-time tokens per second
+                                        if "choices" in chunk and len(chunk["choices"]) > 0:
+                                            if "delta" in chunk["choices"][0] and (
+                                                "content" in chunk["choices"][0]["delta"]
+                                                or "reasoning_content"
+                                                in chunk["choices"][0]["delta"]
+                                            ):
+                                                content = chunk["choices"][0]["delta"].get(
+                                                    "content",
+                                                    chunk["choices"][0]["delta"].get(
+                                                        "reasoning_content"
+                                                    ),
+                                                )
+                                                if content:
+                                                    # Approximate token count (rough estimate)
+                                                    new_tokens = len(content.split())
+                                                    async with self.stream_tokens_lock:
+                                                        self.stream_tokens_count += (
+                                                            new_tokens
+                                                        )
+                                    except json.JSONDecodeError:
+                                        logger.warning(
+                                            f"Failed to parse JSON from stream: {line_text}"
+                                        )
+                                    except Exception as e:
+                                        logger.warning(
+                                            f"Error processing stream chunk: {e}"
+                                        )
+
+                            self.request_count += 1
+                            self.finished_request_count += 1
+                            self.request_success_count += 1
+                            break
+                        if response.status == 429:
+                            _429_count += 1
+                        elif response.status == 400:
+                            _400_count += 1
+                        elif response.status == 401:
+                            logger.error(
+                                "Authentication failed: Invalid or missing API key"
+                            )
+                            break
+                        else:
+                            _request_error_count += 1
+                            logger.error(
+                                f"Request failed: HTTP {response.status}, {await response.text()} at {time.time() - _start_time:.2f} seconds"
+                            )
             except Exception as e:
                 # Log detailed exception information
                 error_type = type(e).__name__
@@ -800,9 +801,8 @@ class VLLMBenchmark:
         """Run the benchmark."""
         self.start_time = time.time()
 
-        async with aiohttp.ClientSession() as metrics_session, aiohttp.ClientSession() as load_session:
+        async with aiohttp.ClientSession() as metrics_session:
             self.metrics_session = metrics_session
-            self.load_session = load_session
             # Create tasks for monitoring metrics and generating load
             monitor_task = asyncio.create_task(self.monitor_metrics())
             load_task = asyncio.create_task(self.generate_load())
