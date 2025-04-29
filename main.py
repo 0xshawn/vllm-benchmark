@@ -357,7 +357,7 @@ class VLLMBenchmark:
                                             self.last_chunk_time = current_chunk_time
 
                                         # Parse usage
-                                        if "usage" in chunk:
+                                        if "usage" in chunk and chunk["usage"]:
                                             _prompt_tokens_count = (
                                                 chunk["usage"].get("prompt_tokens", 0)
                                                 or _prompt_tokens_count
@@ -392,6 +392,7 @@ class VLLMBenchmark:
                                             f"Failed to parse JSON from stream: {line_text}"
                                         )
                                     except Exception as e:
+                                        logger.warning(traceback.format_exc())
                                         logger.warning(
                                             f"Error processing stream chunk: {e}"
                                         )
