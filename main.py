@@ -110,6 +110,19 @@ class VLLMBenchmark:
 
     async def fetch_metrics(self) -> None:
         """Fetch and parse metrics from vLLM /metrics endpoint."""
+        metrics = {
+            "prompt_tokens": None,
+            "generation_tokens": None,
+            "running": None,
+            "pending": None,
+            "request_success": None,
+            "time_to_first_token": None,
+            "e2e_latency": None,
+            "queue_time": None,
+            "inference_time": None,
+            "prefill_time": None,
+            "decode_time": None,
+        }
         try:
             async with self.metrics_session.get(self.metrics_url) as response:
                 if response.status != 200:
@@ -117,20 +130,6 @@ class VLLMBenchmark:
                     return
                 metrics_text = await response.text()
                 timestamp = time.time()
-
-                metrics = {
-                    "prompt_tokens": None,
-                    "generation_tokens": None,
-                    "running": None,
-                    "pending": None,
-                    "request_success": None,
-                    "time_to_first_token": None,
-                    "e2e_latency": None,
-                    "queue_time": None,
-                    "inference_time": None,
-                    "prefill_time": None,
-                    "decode_time": None,
-                }
 
                 for family in text_string_to_metric_families(metrics_text):
                     for sample in family.samples:
@@ -250,6 +249,7 @@ class VLLMBenchmark:
                 self.prev_time = timestamp
 
         except Exception as e:
+            self.metrics_data["time"].append(time.time())
             logger.error(f"Error fetching metrics: {e}")
 
     async def send_request(self, request_id: int) -> None:
@@ -309,7 +309,9 @@ class VLLMBenchmark:
                                         if not line_text.startswith("data: "):
                                             continue
 
-                                        json_str = line_text[6:]  # Remove "data: " prefix
+                                        json_str = line_text[
+                                            6:
+                                        ]  # Remove "data: " prefix
                                         if json_str == "[DONE]":
                                             _request_finish_time = time.time()
                                             _generation_tokens_count = (
@@ -332,9 +334,9 @@ class VLLMBenchmark:
                                             )
 
                                             # Store the first token time
-                                            self.metrics_data["first_token_times"].append(
-                                                first_chunk_time - self.start_time
-                                            )
+                                            self.metrics_data[
+                                                "first_token_times"
+                                            ].append(first_chunk_time - self.start_time)
 
                                             first_chunk_received = True
                                             _prefill_finish_time = first_chunk_time
@@ -346,7 +348,8 @@ class VLLMBenchmark:
                                             # Calculate decode time from second chunk onwards
                                             current_chunk_time = time.time()
                                             decode_time = (
-                                                current_chunk_time - self.last_chunk_time
+                                                current_chunk_time
+                                                - self.last_chunk_time
                                             )
 
                                             # Store the decode time
@@ -363,18 +366,26 @@ class VLLMBenchmark:
                                                 or _prompt_tokens_count
                                             )
                                             _generation_tokens_count = (
-                                                chunk["usage"].get("completion_tokens", 0)
+                                                chunk["usage"].get(
+                                                    "completion_tokens", 0
+                                                )
                                                 or _generation_tokens_count
                                             )
 
                                         # Track tokens received and calculate real-time tokens per second
-                                        if "choices" in chunk and len(chunk["choices"]) > 0:
+                                        if (
+                                            "choices" in chunk
+                                            and len(chunk["choices"]) > 0
+                                        ):
                                             if "delta" in chunk["choices"][0] and (
-                                                "content" in chunk["choices"][0]["delta"]
+                                                "content"
+                                                in chunk["choices"][0]["delta"]
                                                 or "reasoning_content"
                                                 in chunk["choices"][0]["delta"]
                                             ):
-                                                content = chunk["choices"][0]["delta"].get(
+                                                content = chunk["choices"][0][
+                                                    "delta"
+                                                ].get(
                                                     "content",
                                                     chunk["choices"][0]["delta"].get(
                                                         "reasoning_content"
