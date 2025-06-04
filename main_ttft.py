@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TIMEOUT = 60
+TIMEOUT = 60 * 10
 
 
 def get_timestamp():
@@ -59,7 +59,16 @@ class VLLMTTFTBenchmark:
             "qps": [],
             "token_processing_rate": [],
             "max_connections": [],
+            "prompt_tokens_rate": [],  # Tokens per second for prompts
+            "generation_tokens_rate": [],  # Tokens per second for generation
         }
+
+        # Token usage tracking
+        self.total_prompt_tokens = 0
+        self.total_generation_tokens = 0
+        self.last_token_count_time = None
+        self.last_prompt_tokens = 0
+        self.last_generation_tokens = 0
 
         # Request tracking
         self.active_requests = 0
@@ -121,6 +130,20 @@ class VLLMTTFTBenchmark:
                                     json_str = line_text[6:]  # Remove "data: " prefix
                                     if json_str == "[DONE]":
                                         break
+
+                                    data = json.loads(json_str)
+
+                                    # Track token usage
+                                    if "usage" in data:
+                                        usage = data["usage"]
+                                        if "prompt_tokens" in usage:
+                                            self.total_prompt_tokens += usage[
+                                                "prompt_tokens"
+                                            ]
+                                        if "completion_tokens" in usage:
+                                            self.total_generation_tokens += usage[
+                                                "completion_tokens"
+                                            ]
 
                                     if not first_token_received:
                                         first_token_time = time.time()
@@ -203,6 +226,26 @@ class VLLMTTFTBenchmark:
                 qps = recent_requests / time_window
                 self.metrics_data["qps"].append(qps)
 
+            # Calculate token processing rates
+            if self.last_token_count_time is not None:
+                time_diff = current_time - self.last_token_count_time
+                if time_diff > 0:
+                    prompt_tokens_rate = (
+                        self.total_prompt_tokens - self.last_prompt_tokens
+                    ) / time_diff
+                    generation_tokens_rate = (
+                        self.total_generation_tokens - self.last_generation_tokens
+                    ) / time_diff
+
+                    self.metrics_data["prompt_tokens_rate"].append(prompt_tokens_rate)
+                    self.metrics_data["generation_tokens_rate"].append(
+                        generation_tokens_rate
+                    )
+
+            self.last_token_count_time = current_time
+            self.last_prompt_tokens = self.total_prompt_tokens
+            self.last_generation_tokens = self.total_generation_tokens
+
             # Calculate average TTFT
             if self.metrics_data["ttft"]:
                 avg_ttft = sum(self.metrics_data["ttft"][-10:]) / min(
@@ -212,7 +255,9 @@ class VLLMTTFTBenchmark:
                     f"Current metrics - Active requests: {self.active_requests}, "
                     f"Max connections: {self.max_connections}, "
                     f"Avg TTFT: {avg_ttft:.2f}s, "
-                    f"QPS: {qps:.2f}"
+                    f"QPS: {qps:.2f}, "
+                    f"Prompt tokens/s: {prompt_tokens_rate:.2f}, "
+                    f"Generation tokens/s: {generation_tokens_rate:.2f}"
                 )
 
             await asyncio.sleep(1)
@@ -240,13 +285,15 @@ class VLLMTTFTBenchmark:
             return
 
         fig = make_subplots(
-            rows=3,
+            rows=4,
             cols=2,
             subplot_titles=(
                 "Time to First Token",
                 "Running Requests",
                 "QPS",
                 "Max Connections",
+                "Prompt Tokens Rate",
+                "Generation Tokens Rate",
             ),
             vertical_spacing=0.12,
         )
@@ -303,11 +350,37 @@ class VLLMTTFTBenchmark:
             col=2,
         )
 
+        # Add prompt tokens rate plot
+        fig.add_trace(
+            go.Scatter(
+                x=times,
+                y=self.metrics_data["prompt_tokens_rate"],
+                mode="lines+markers",
+                name="Prompt Tokens/s",
+                marker=dict(size=2),
+            ),
+            row=3,
+            col=1,
+        )
+
+        # Add generation tokens rate plot
+        fig.add_trace(
+            go.Scatter(
+                x=times,
+                y=self.metrics_data["generation_tokens_rate"],
+                mode="lines+markers",
+                name="Generation Tokens/s",
+                marker=dict(size=2),
+            ),
+            row=3,
+            col=2,
+        )
+
         # Update layout
         fig.update_layout(
             title_text="vLLM TTFT Benchmark Results",
             showlegend=True,
-            height=1200,
+            height=1600,
             width=1400,
         )
 
@@ -316,12 +389,22 @@ class VLLMTTFTBenchmark:
         fig.update_yaxes(title_text="Count", row=1, col=2)
         fig.update_yaxes(title_text="Requests/s", row=2, col=1)
         fig.update_yaxes(title_text="Count", row=2, col=2)
+        fig.update_yaxes(title_text="Tokens/s", row=3, col=1)
+        fig.update_yaxes(title_text="Tokens/s", row=3, col=2)
 
         output_file = os.path.join(
             self.output_dir, f"vllm_ttft_benchmark_{get_timestamp()}.html"
         )
         fig.write_html(output_file)
         logger.info(f"Benchmark results saved to {output_file}")
+
+        # Print token usage statistics
+        logger.info("\nToken Usage Statistics:")
+        logger.info(f"Total Prompt Tokens: {self.total_prompt_tokens}")
+        logger.info(f"Total Generation Tokens: {self.total_generation_tokens}")
+        logger.info(
+            f"Total Tokens: {self.total_prompt_tokens + self.total_generation_tokens}"
+        )
 
     async def run(self) -> None:
         """Run the benchmark."""
