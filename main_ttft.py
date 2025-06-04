@@ -44,9 +44,11 @@ class VLLMTTFTBenchmark:
         model: str,
     ):
         self.vllm_url = vllm_url.rstrip("/")
+        self.initial_max_connections = initial_max_connections
         self.max_connections = initial_max_connections
         self.duration = duration
         self.target_qps = target_qps
+        self.current_qps = target_qps * 20  # Start with 20x QPS
         self.api_key = api_key
         self.model = model
         self.long_context = True
@@ -78,10 +80,10 @@ class VLLMTTFTBenchmark:
         self.stop_event = asyncio.Event()
 
         # TTFT tracking for gradual adjustments
-        self.ttft_window = []  # Store last 10 TTFT measurements
-        self.last_adjustment_time = 0
-        self.adjustment_interval = 5
         self.adjustment_step = 10
+        self.timeout_count = 0
+        self.last_timeout_check = 0
+        self.timeout_check_interval = 30
 
         # Output directory
         self.output_dir = "benchmark_results"
@@ -121,6 +123,17 @@ class VLLMTTFTBenchmark:
                 ) as response:
                     if response.status == 200:
                         async for line in response.content:
+                            # Check if we've exceeded the 20-second timeout for first token
+                            if (
+                                not first_token_received
+                                and time.time() - request_start_time > 20
+                            ):
+                                logger.warning(
+                                    f"Request {request_id} timed out waiting for first token"
+                                )
+                                self.timeout_count += 1
+                                return
+
                             if line:
                                 try:
                                     line_text = line.decode("utf-8").strip()
@@ -152,36 +165,6 @@ class VLLMTTFTBenchmark:
                                         ttft = first_token_time - request_start_time
                                         self.metrics_data["ttft"].append(ttft)
 
-                                        # Update TTFT window
-                                        self.ttft_window.append(ttft)
-                                        if len(self.ttft_window) > 10:
-                                            self.ttft_window.pop(0)
-
-                                        # Adjust max_connections periodically based on average TTFT
-                                        current_time = time.time()
-                                        if (
-                                            current_time - self.last_adjustment_time
-                                            >= self.adjustment_interval
-                                        ):
-                                            avg_ttft = sum(self.ttft_window) / len(
-                                                self.ttft_window
-                                            )
-                                            if avg_ttft > 20:
-                                                self.max_connections = max(
-                                                    1,
-                                                    self.max_connections
-                                                    - self.adjustment_step,
-                                                )
-                                            else:
-                                                self.max_connections += (
-                                                    self.adjustment_step
-                                                )
-
-                                            self.last_adjustment_time = current_time
-                                            self.metrics_data["max_connections"].append(
-                                                self.max_connections
-                                            )
-
                                 except json.JSONDecodeError:
                                     logger.warning(
                                         f"Failed to parse JSON from stream: {line_text}"
@@ -197,6 +180,7 @@ class VLLMTTFTBenchmark:
 
         except asyncio.TimeoutError:
             logger.warning(f"Request timed out after {TIMEOUT} seconds")
+            self.timeout_count += 1
         except Exception as e:
             logger.error(f"Request error: {str(e)}")
             # Log detailed exception information
@@ -207,6 +191,29 @@ class VLLMTTFTBenchmark:
         finally:
             self.active_requests -= 1
 
+    async def adjust_max_connections(self, current_time: float) -> None:
+        """Adjust max_connections based on timeout rate."""
+        if self.active_requests > self.max_connections:
+            return
+
+        if current_time - self.last_timeout_check < self.timeout_check_interval:
+            return
+
+        if self.timeout_count > 0:
+            self.max_connections = self.max_connections - self.adjustment_step
+            logger.info(
+                f"Reducing max_connections to {self.max_connections} due to high timeout rate"
+            )
+        else:
+            self.max_connections = self.max_connections + self.adjustment_step
+            logger.info(
+                f"Increasing max_connections to {self.max_connections} due to low timeout rate"
+            )
+
+        # Reset counters
+        self.timeout_count = 0
+        self.last_timeout_check = current_time
+
     async def monitor_metrics(self) -> None:
         """Periodically collect and update metrics."""
         while not self.stop_event.is_set():
@@ -216,6 +223,7 @@ class VLLMTTFTBenchmark:
             # Record metrics
             self.metrics_data["time"].append(elapsed)
             self.metrics_data["running_requests"].append(self.active_requests)
+            self.metrics_data["max_connections"].append(self.max_connections)
 
             # Calculate QPS (over last 5 seconds)
             if len(self.metrics_data["time"]) > 1:
@@ -225,6 +233,15 @@ class VLLMTTFTBenchmark:
                 )
                 qps = recent_requests / time_window
                 self.metrics_data["qps"].append(qps)
+
+            # Check timeouts and adjust max_connections
+            await self.adjust_max_connections(current_time)
+
+            # Adjust QPS based on active connections
+            if self.active_requests >= self.max_connections:
+                self.current_qps = self.target_qps
+            else:
+                self.current_qps = self.target_qps * 10
 
             # Calculate token processing rates
             if self.last_token_count_time is not None:
@@ -252,19 +269,21 @@ class VLLMTTFTBenchmark:
                     10, len(self.metrics_data["ttft"])
                 )
                 logger.info(
-                    f"Current metrics - Active requests: {self.active_requests}, "
-                    f"Max connections: {self.max_connections}, "
+                    f"Finished: {self.total_requests}, "
+                    f"Active: {self.active_requests}, "
+                    f"Max Conn: {self.max_connections}, "
+                    f"Current QPS: {self.current_qps:.2f}, "
                     f"Avg TTFT: {avg_ttft:.2f}s, "
                     f"QPS: {qps:.2f}, "
-                    f"Prompt tokens/s: {prompt_tokens_rate:.2f}, "
-                    f"Generation tokens/s: {generation_tokens_rate:.2f}"
+                    f"Prompt tps: {prompt_tokens_rate:.2f}, "
+                    f"Gen tps: {generation_tokens_rate:.2f}"
                 )
 
             await asyncio.sleep(1)
 
     async def generate_load(self) -> None:
         """Generate load with dynamic concurrency control."""
-        interval = 1.0 / self.target_qps if self.target_qps > 0 else 0
+        interval = 1.0 / self.current_qps if self.current_qps > 0 else 0
         end_time = self.start_time + self.duration
         request_id = 0
 
