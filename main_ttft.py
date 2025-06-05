@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import csv
 import json
 import logging
 import os
@@ -26,11 +27,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TIMEOUT = 60 * 10
-WARMUP_TIME = 6  # 2 minutes
-# PROMPT_LENGTH = 9000  # 4500 + 500 = 5000
-# MAX_TOKENS = 9000 + 2000
-PROMPT_LENGTH = 4500
-MAX_TOKENS = 4500 + 500
+WARMUP_TIME = 180  # 3 minutes
+PROMPT_LENGTH = 9000  # 4500 + 500 = 5000
+MAX_TOKENS = 9000 + 2000
+# PROMPT_LENGTH = 4500
+# MAX_TOKENS = 4500 + 500
+
+MAX_CONNECTIONS = 2500
 
 
 def get_timestamp():
@@ -40,6 +43,7 @@ def get_timestamp():
 class RequestContext(BaseModel):
     """Context for tracking request state and metrics."""
 
+    request_id: int
     payload: dict = None
     headers: dict = None
     request_start_time: float
@@ -51,6 +55,10 @@ class RequestContext(BaseModel):
     status_code: Optional[int] = None
     should_break: bool = False
     should_continue: bool = False
+    request_cost: float = 0.0
+    prefill_cost: float = 0.0
+    decode_cost: float = 0.0
+    is_success: bool = False
 
 
 class VLLMTTFTBenchmark:
@@ -70,7 +78,7 @@ class VLLMTTFTBenchmark:
         self.max_connections = initial_max_connections
         self.duration = duration
         self.target_qps = target_qps
-        self.current_qps = target_qps * 1  # Start with 10x QPS
+        self.current_qps = target_qps * 5  # Start with 1x QPS
         self.api_key = api_key
         self.model = model
 
@@ -102,7 +110,7 @@ class VLLMTTFTBenchmark:
         self.stop_event = asyncio.Event()
 
         # TTFT tracking for gradual adjustments
-        self.adjustment_step = 30
+        self.adjustment_step = 100
         self.timeout_count = 0
         self.last_timeout_check = 0
         self.timeout_check_interval = 30
@@ -110,6 +118,45 @@ class VLLMTTFTBenchmark:
         # Output directory
         self.output_dir = "benchmark_results"
         os.makedirs(self.output_dir, exist_ok=True)
+
+        # CSV file setup
+        self.csv_file = os.path.join(
+            self.output_dir, f"vllm_ttft_benchmark_{get_timestamp()}.csv"
+        )
+        self.csv_headers = [
+            "request_id",
+            "request_cost",
+            "ttft",
+            "prefill_cost",
+            "decode_cost",
+            "prompt_tokens",
+            "generation_tokens",
+            "is_success",
+        ]
+        self._setup_csv_file()
+
+    def _setup_csv_file(self):
+        """Initialize the CSV file with headers."""
+        with open(self.csv_file, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.csv_headers)
+            writer.writeheader()
+
+    def _write_metrics_to_csv(self, ctx: RequestContext):
+        """Write request metrics to CSV file."""
+        with open(self.csv_file, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.csv_headers)
+            writer.writerow(
+                {
+                    "request_id": ctx.request_id,
+                    "request_cost": ctx.request_cost,
+                    "ttft": int(ctx.first_token_time - ctx.request_start_time),
+                    "prefill_cost": ctx.prefill_cost,
+                    "decode_cost": ctx.decode_cost,
+                    "prompt_tokens": ctx.prompt_tokens,
+                    "generation_tokens": ctx.generation_tokens,
+                    "is_success": ctx.is_success,
+                }
+            )
 
     def prepare_payload(self, ctx: RequestContext) -> None:
         """Prepare payload and headers for the request."""
@@ -152,13 +199,12 @@ class VLLMTTFTBenchmark:
             data = json.loads(json_str)
             if "usage" in data and not self.is_warmup():
                 self._update_token_usage(data["usage"])
+                ctx.prompt_tokens = data["usage"].get("prompt_tokens", 0)
+                ctx.generation_tokens = data["usage"].get("completion_tokens", 0)
 
             if not ctx.first_token_received:
                 ctx.first_token_time = time.time()
                 ctx.first_token_received = True
-                if not self.is_warmup():
-                    ttft = ctx.first_token_time - ctx.request_start_time
-                    self.metrics_data["ttft"].append(ttft)
         except json.JSONDecodeError:
             logger.warning(f"Failed to parse JSON from stream: {line_text}")
         except Exception as e:
@@ -173,17 +219,17 @@ class VLLMTTFTBenchmark:
 
     async def is_ttft_timeout(self, ctx: RequestContext) -> bool:
         """Check if request has timeout waiting for first token."""
-        if time.time() - ctx.connected_time > 20:
-            logger.error(f"TTFT > 20, cancel request")
+        if time.time() - ctx.connected_time > 30:
+            logger.error(f"TTFT > 30, cancel request")
             return True
         return False
 
     def is_warmup(self) -> bool:
         return time.time() < self.start_time + WARMUP_TIME
 
-    async def send_request(self) -> None:
+    async def send_request(self, request_id: int) -> None:
         """Send a request to the vLLM service and process the response."""
-        ctx = RequestContext(request_start_time=time.time())
+        ctx = RequestContext(request_id=request_id, request_start_time=time.time())
         self.prepare_payload(ctx)
         self.active_requests += 1
         self.total_requests += 1
@@ -204,6 +250,9 @@ class VLLMTTFTBenchmark:
                                 if await self.is_ttft_timeout(ctx):
                                     self.timeout_count += 1
                                     self.failed_requests += 1
+                                    ctx.is_success = False
+                                    # set `first_token_time` to a larger value for metrics
+                                    ctx.first_token_time = self.start_time + 100
                                     return
                             if line:
                                 await self._process_stream_line(line, ctx)
@@ -214,14 +263,18 @@ class VLLMTTFTBenchmark:
                                 continue
 
                         self.successful_requests += 1
+                        ctx.is_success = True
                     elif response.status == 429:
+                        ctx.is_success = False
                         return
                     else:
                         logger.error(f"Request failed: HTTP {response.status}")
+                        ctx.is_success = False
         except asyncio.TimeoutError:
             logger.warning(f"Request timed out after {TIMEOUT} seconds")
             self.timeout_count += 1
             self.failed_requests += 1
+            ctx.is_success = False
         except Exception as e:
             # Log detailed exception information
             logger.error(f"Request error: {str(e)}")
@@ -229,7 +282,24 @@ class VLLMTTFTBenchmark:
             error_msg = str(e)
             logger.error(f"Request error: {error_type}: {error_msg}")
             logger.error(traceback.format_exc())
+            ctx.is_success = False
         finally:
+            # Calculate costs
+            if ctx.first_token_time:
+                ctx.prefill_cost = ctx.first_token_time - ctx.request_start_time
+            if ctx.connected_time:
+                ctx.request_cost = time.time() - ctx.request_start_time
+                if ctx.first_token_time:
+                    ctx.decode_cost = ctx.request_cost - ctx.prefill_cost
+
+            if not ctx.first_token_time:
+                ctx.first_token_time = ctx.request_start_time
+
+            if not self.is_warmup():
+                ttft = ctx.first_token_time - ctx.request_start_time
+                self.metrics_data["ttft"].append(ttft)
+
+            self._write_metrics_to_csv(ctx)
             self.active_requests -= 1
 
     async def adjust_max_connections(self, current_time: float) -> None:
@@ -250,6 +320,8 @@ class VLLMTTFTBenchmark:
                 logger.info(
                     f"Increasing max_connections to {self.max_connections} due to low timeout rate"
                 )
+
+        self.max_connections = min(self.max_connections, MAX_CONNECTIONS)
 
         # Reset counters
         self.timeout_count = 0
@@ -334,12 +406,14 @@ class VLLMTTFTBenchmark:
     async def generate_load(self) -> None:
         """Generate load with dynamic concurrency control."""
         interval = 1.0 / self.current_qps if self.current_qps > 0 else 0
-        end_time = self.start_time + self.duration
+        end_time = self.start_time + self.duration + WARMUP_TIME
 
         logger.info(f"Warmup for {WARMUP_TIME} seconds")
+        request_id = 1
         while time.time() < end_time and not self.stop_event.is_set():
             if self.active_requests < self.max_connections:
-                asyncio.create_task(self.send_request())
+                asyncio.create_task(self.send_request(request_id))
+                request_id += 1
                 if interval > 0:
                     await asyncio.sleep(interval)
             else:
