@@ -25,6 +25,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TIMEOUT = 60 * 10
+WARMUP_TIME = 60  # 2 minutes
+PROMPT_LENGTH = 9000  # 4500 + 500 = 5000
+MAX_TOKENS = 9000 + 2000
 
 
 def get_timestamp():
@@ -51,7 +54,6 @@ class VLLMTTFTBenchmark:
         self.current_qps = target_qps * 20  # Start with 20x QPS
         self.api_key = api_key
         self.model = model
-        self.long_context = True
 
         # Metrics collection
         self.metrics_data: Dict[str, List[float]] = {
@@ -89,23 +91,75 @@ class VLLMTTFTBenchmark:
         self.output_dir = "benchmark_results"
         os.makedirs(self.output_dir, exist_ok=True)
 
-    async def send_request(self, request_id: int) -> None:
-        max_tokens = 1000
-        if self.long_context:
-            prompt_pair = random.choice(LONG_PROMPT_PAIRS)
-            content = prompt_pair["context"] + "\n\n" + prompt_pair["prompt"]
-            max_tokens = 9000
-        else:
-            content = " ".join((random.choice(SHORT_PROMPTS) * 100).split(" "))[:450]
+    def prepare_payload(self) -> tuple[dict, dict]:
+        """Prepare payload and headers for the request."""
+        prompt_pair = random.choice(LONG_PROMPT_PAIRS)
+        content = prompt_pair["context"] + "\n\n" + prompt_pair["prompt"]
+        if len(content) < PROMPT_LENGTH:
+            # Expand the prompt by repeating it until it reaches the desired length
+            while len(content) < PROMPT_LENGTH:
+                content += "\n\n" + content
+            content = content[:PROMPT_LENGTH]  # Trim to exact length if needed
 
         payload = {
             "model": self.model,
             "messages": [{"role": "user", "content": content}],
-            "max_tokens": max_tokens,
+            "max_tokens": MAX_TOKENS,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        return payload, headers
+
+    async def _process_stream_line(
+        self,
+        line_text: str,
+        request_start_time: float,
+        first_token_received: bool,
+        first_token_time: Optional[float],
+    ) -> None:
+        """Process a single line from the stream response."""
+        if not line_text.startswith("data: "):
+            return
+
+        json_str = line_text[6:]  # Remove "data: " prefix
+        if json_str == "[DONE]":
+            return
+
+        try:
+            data = json.loads(json_str)
+            if "usage" in data:
+                self._update_token_usage(data["usage"])
+
+            if not first_token_received:
+                first_token_time = time.time()
+                first_token_received = True
+                # Record TTFT
+                ttft = first_token_time - request_start_time
+                self.metrics_data["ttft"].append(ttft)
+
+        except json.JSONDecodeError:
+            logger.warning(f"Failed to parse JSON from stream: {line_text}")
+        except Exception as e:
+            logger.warning(f"Error processing stream chunk: {e}")
+
+    def _update_token_usage(self, usage: dict) -> None:
+        """Update token usage statistics."""
+        if "prompt_tokens" in usage:
+            self.total_prompt_tokens += usage["prompt_tokens"]
+        if "completion_tokens" in usage:
+            self.total_generation_tokens += usage["completion_tokens"]
+
+    async def _handle_request_timeout(self, request_start_time: float) -> bool:
+        """Check if request has timeout waiting for first token."""
+        if time.time() - request_start_time > 20:
+            self.timeout_count += 1
+            return True
+        return False
+
+    async def send_request(self) -> None:
+        """Send a request to the vLLM service and process the response."""
+        payload, headers = self.prepare_payload()
 
         self.active_requests += 1
         self.total_requests += 1
@@ -123,61 +177,26 @@ class VLLMTTFTBenchmark:
                 ) as response:
                     if response.status == 200:
                         async for line in response.content:
-                            # Check if we've exceeded the 20-second timeout for first token
-                            if (
-                                not first_token_received
-                                and time.time() - request_start_time > 20
-                            ):
-                                logger.warning(
-                                    f"Request {request_id} timed out waiting for first token"
-                                )
-                                self.timeout_count += 1
+                            # Do not handle warmup requests
+                            if time.time() < self.start_time + WARMUP_TIME:
+                                continue
+
+                            # Check for timeout
+                            if await self._handle_request_timeout(request_start_time):
                                 return
 
                             if line:
-                                try:
-                                    line_text = line.decode("utf-8").strip()
-                                    if not line_text.startswith("data: "):
-                                        continue
-
-                                    json_str = line_text[6:]  # Remove "data: " prefix
-                                    if json_str == "[DONE]":
-                                        break
-
-                                    data = json.loads(json_str)
-
-                                    # Track token usage
-                                    if "usage" in data:
-                                        usage = data["usage"]
-                                        if "prompt_tokens" in usage:
-                                            self.total_prompt_tokens += usage[
-                                                "prompt_tokens"
-                                            ]
-                                        if "completion_tokens" in usage:
-                                            self.total_generation_tokens += usage[
-                                                "completion_tokens"
-                                            ]
-
-                                    if not first_token_received:
-                                        first_token_time = time.time()
-                                        first_token_received = True
-                                        # Record TTFT
-                                        ttft = first_token_time - request_start_time
-                                        self.metrics_data["ttft"].append(ttft)
-
-                                except json.JSONDecodeError:
-                                    logger.warning(
-                                        f"Failed to parse JSON from stream: {line_text}"
-                                    )
-                                except Exception as e:
-                                    logger.warning(
-                                        f"Error processing stream chunk: {e}"
-                                    )
+                                line_text = line.decode("utf-8").strip()
+                                first_token_received = await self._process_stream_line(
+                                    line_text,
+                                    request_start_time,
+                                    first_token_received,
+                                    first_token_time,
+                                )
 
                         self.successful_requests += 1
                     else:
                         logger.error(f"Request failed: HTTP {response.status}")
-
         except asyncio.TimeoutError:
             logger.warning(f"Request timed out after {TIMEOUT} seconds")
             self.timeout_count += 1
@@ -217,6 +236,10 @@ class VLLMTTFTBenchmark:
     async def monitor_metrics(self) -> None:
         """Periodically collect and update metrics."""
         while not self.stop_event.is_set():
+            if time.time() < self.start_time + WARMUP_TIME:
+                await asyncio.sleep(1)
+                continue
+
             current_time = time.time()
             elapsed = current_time - self.start_time
 
@@ -226,6 +249,7 @@ class VLLMTTFTBenchmark:
             self.metrics_data["max_connections"].append(self.max_connections)
 
             # Calculate QPS (over last 5 seconds)
+            qps = 0
             if len(self.metrics_data["time"]) > 1:
                 time_window = 5
                 recent_requests = sum(
@@ -244,6 +268,8 @@ class VLLMTTFTBenchmark:
                 self.current_qps = self.target_qps * 10
 
             # Calculate token processing rates
+            prompt_tokens_rate = 0
+            generation_tokens_rate = 0
             if self.last_token_count_time is not None:
                 time_diff = current_time - self.last_token_count_time
                 if time_diff > 0:
@@ -285,12 +311,11 @@ class VLLMTTFTBenchmark:
         """Generate load with dynamic concurrency control."""
         interval = 1.0 / self.current_qps if self.current_qps > 0 else 0
         end_time = self.start_time + self.duration
-        request_id = 0
 
+        logger.info(f"Warmup for {WARMUP_TIME} seconds")
         while time.time() < end_time and not self.stop_event.is_set():
             if self.active_requests < self.max_connections:
-                asyncio.create_task(self.send_request(request_id))
-                request_id += 1
+                asyncio.create_task(self.send_request())
                 if interval > 0:
                     await asyncio.sleep(interval)
             else:
@@ -403,13 +428,18 @@ class VLLMTTFTBenchmark:
             width=1400,
         )
 
-        # Update y-axis labels
-        fig.update_yaxes(title_text="Seconds", row=1, col=1)
-        fig.update_yaxes(title_text="Count", row=1, col=2)
-        fig.update_yaxes(title_text="Requests/s", row=2, col=1)
-        fig.update_yaxes(title_text="Count", row=2, col=2)
-        fig.update_yaxes(title_text="Tokens/s", row=3, col=1)
-        fig.update_yaxes(title_text="Tokens/s", row=3, col=2)
+        # Update y-axis labels and formatting
+        fig.update_yaxes(title_text="Seconds", row=1, col=1, tickformat=".0f")
+        fig.update_yaxes(title_text="Count", row=1, col=2, tickformat=".0f")
+        fig.update_yaxes(title_text="Requests/s", row=2, col=1, tickformat=".0f")
+        fig.update_yaxes(title_text="Count", row=2, col=2, tickformat=".0f")
+        fig.update_yaxes(title_text="Tokens/s", row=3, col=1, tickformat=".0f")
+        fig.update_yaxes(title_text="Tokens/s", row=3, col=2, tickformat=".0f")
+
+        # Update x-axis formatting for all subplots
+        for i in range(1, 4):
+            for j in range(1, 3):
+                fig.update_xaxes(tickformat=".0f", row=i, col=j)
 
         output_file = os.path.join(
             self.output_dir, f"vllm_ttft_benchmark_{get_timestamp()}.html"
@@ -423,6 +453,11 @@ class VLLMTTFTBenchmark:
         logger.info(f"Total Generation Tokens: {self.total_generation_tokens}")
         logger.info(
             f"Total Tokens: {self.total_prompt_tokens + self.total_generation_tokens}"
+        )
+        logger.info(f"Avg Input TPS: {self.total_prompt_tokens / self.duration}")
+        logger.info(f"Avg Output TPS: {self.total_generation_tokens / self.duration}")
+        logger.info(
+            f"Avg TPS: {(self.total_prompt_tokens + self.total_generation_tokens) / self.duration}"
         )
 
     async def run(self) -> None:
@@ -485,6 +520,11 @@ def parse_args():
         "--model",
         default="phala/deepseek-r1-70b",
         help="Model name for requests (default: phala/deepseek-r1-70b)",
+    )
+    parser.add_argument(
+        "--long-context",
+        action="store_true",
+        help="Use long context for requests (default: False)",
     )
     return parser.parse_args()
 
