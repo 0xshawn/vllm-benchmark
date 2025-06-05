@@ -14,6 +14,7 @@ import aiohttp
 import numpy as np
 import plotly.graph_objs as go
 from plotly.subplots import make_subplots
+from pydantic import BaseModel
 
 from prompt import LONG_PROMPT_PAIRS
 
@@ -34,6 +35,22 @@ MAX_TOKENS = 4500 + 500
 
 def get_timestamp():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+class RequestContext(BaseModel):
+    """Context for tracking request state and metrics."""
+
+    payload: dict = None
+    headers: dict = None
+    request_start_time: float
+    first_token_received: bool = False
+    first_token_time: Optional[float] = None
+    connected_time: Optional[float] = None
+    prompt_tokens: int = 0
+    generation_tokens: int = 0
+    status_code: Optional[int] = None
+    should_break: bool = False
+    should_continue: bool = False
 
 
 class VLLMTTFTBenchmark:
@@ -85,7 +102,7 @@ class VLLMTTFTBenchmark:
         self.stop_event = asyncio.Event()
 
         # TTFT tracking for gradual adjustments
-        self.adjustment_step = 10
+        self.adjustment_step = 30
         self.timeout_count = 0
         self.last_timeout_check = 0
         self.timeout_check_interval = 30
@@ -94,7 +111,7 @@ class VLLMTTFTBenchmark:
         self.output_dir = "benchmark_results"
         os.makedirs(self.output_dir, exist_ok=True)
 
-    def prepare_payload(self) -> tuple[dict, dict]:
+    def prepare_payload(self, ctx: RequestContext) -> None:
         """Prepare payload and headers for the request."""
         prompt_pair = random.choice(LONG_PROMPT_PAIRS)
         content = prompt_pair["context"] + "\n\n" + prompt_pair["prompt"]
@@ -112,21 +129,23 @@ class VLLMTTFTBenchmark:
             "stream_options": {"include_usage": True},
         }
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
-        return payload, headers
+        ctx.payload = payload
+        ctx.headers = headers
 
     async def _process_stream_line(
         self,
-        line_text: str,
-        request_start_time: float,
-        first_token_received: bool,
-        first_token_time: Optional[float],
-    ) -> bool:
+        line: str,
+        ctx: RequestContext,
+    ) -> None:
         """Process a single line from the stream response."""
+        line_text = line.decode("utf-8").strip()
         if not line_text.startswith("data: "):
+            ctx.should_continue = True
             return
 
         json_str = line_text[6:]  # Remove "data: " prefix
         if json_str == "[DONE]":
+            ctx.should_break = True
             return
 
         try:
@@ -134,18 +153,16 @@ class VLLMTTFTBenchmark:
             if "usage" in data and not self.is_warmup():
                 self._update_token_usage(data["usage"])
 
-            # Record TTFT
-            first_token_time = time.time()
-            first_token_received = True
-            if not self.is_warmup():
-                ttft = first_token_time - request_start_time
-                self.metrics_data["ttft"].append(ttft)
+            if not ctx.first_token_received:
+                ctx.first_token_time = time.time()
+                ctx.first_token_received = True
+                if not self.is_warmup():
+                    ttft = ctx.first_token_time - ctx.request_start_time
+                    self.metrics_data["ttft"].append(ttft)
         except json.JSONDecodeError:
             logger.warning(f"Failed to parse JSON from stream: {line_text}")
         except Exception as e:
             logger.warning(f"Error processing stream chunk: {e}")
-
-        return first_token_received
 
     def _update_token_usage(self, usage: dict) -> None:
         """Update token usage statistics."""
@@ -154,12 +171,10 @@ class VLLMTTFTBenchmark:
         if "completion_tokens" in usage:
             self.total_generation_tokens += usage["completion_tokens"]
 
-    async def _handle_request_timeout(self, connected_time: float) -> bool:
+    async def is_ttft_timeout(self, ctx: RequestContext) -> bool:
         """Check if request has timeout waiting for first token."""
-        if time.time() - connected_time > 20:
-            logger.warning(f"Request timed out after 20 seconds")
-            self.timeout_count += 1
-            self.failed_requests += 1
+        if time.time() - ctx.connected_time > 20:
+            logger.error(f"TTFT > 20, cancel request")
             return True
         return False
 
@@ -168,40 +183,39 @@ class VLLMTTFTBenchmark:
 
     async def send_request(self) -> None:
         """Send a request to the vLLM service and process the response."""
-        payload, headers = self.prepare_payload()
-
+        ctx = RequestContext(request_start_time=time.time())
+        self.prepare_payload(ctx)
         self.active_requests += 1
         self.total_requests += 1
-        request_start_time = time.time()
-        first_token_received = False
-        first_token_time = None
-
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     f"{self.vllm_url}/v1/chat/completions",
-                    json=payload,
-                    headers=headers,
+                    json=ctx.payload,
+                    headers=ctx.headers,
                     timeout=TIMEOUT,
                 ) as response:
+                    ctx.status_code = response.status
                     if response.status == 200:
-                        connected_time = time.time()
+                        ctx.connected_time = time.time()
                         async for line in response.content:
                             # Check for timeout
-                            if not first_token_received:
-                                if await self._handle_request_timeout(connected_time):
+                            if not ctx.first_token_received:
+                                if await self.is_ttft_timeout(ctx):
+                                    self.timeout_count += 1
+                                    self.failed_requests += 1
                                     return
-
                             if line:
-                                line_text = line.decode("utf-8").strip()
-                                first_token_received = await self._process_stream_line(
-                                    line_text,
-                                    request_start_time,
-                                    first_token_received,
-                                    first_token_time,
-                                )
+                                await self._process_stream_line(line, ctx)
+                            if ctx.should_break:
+                                break
+                            if ctx.should_continue:
+                                ctx.should_continue = False
+                                continue
 
                         self.successful_requests += 1
+                    elif response.status == 429:
+                        return
                     else:
                         logger.error(f"Request failed: HTTP {response.status}")
         except asyncio.TimeoutError:
@@ -209,8 +223,8 @@ class VLLMTTFTBenchmark:
             self.timeout_count += 1
             self.failed_requests += 1
         except Exception as e:
-            logger.error(f"Request error: {str(e)}")
             # Log detailed exception information
+            logger.error(f"Request error: {str(e)}")
             error_type = type(e).__name__
             error_msg = str(e)
             logger.error(f"Request error: {error_type}: {error_msg}")
@@ -222,7 +236,6 @@ class VLLMTTFTBenchmark:
         """Adjust max_connections based on timeout rate."""
         if self.active_requests > self.max_connections:
             return
-
         if current_time - self.last_timeout_check < self.timeout_check_interval:
             return
 
@@ -232,10 +245,11 @@ class VLLMTTFTBenchmark:
                 f"Reducing max_connections to {self.max_connections} due to high timeout rate"
             )
         else:
-            self.max_connections = self.max_connections + self.adjustment_step
-            logger.info(
-                f"Increasing max_connections to {self.max_connections} due to low timeout rate"
-            )
+            if self.active_requests >= self.max_connections:
+                self.max_connections = self.max_connections + self.adjustment_step
+                logger.info(
+                    f"Increasing max_connections to {self.max_connections} due to low timeout rate"
+                )
 
         # Reset counters
         self.timeout_count = 0
@@ -464,10 +478,12 @@ class VLLMTTFTBenchmark:
         logger.info(
             f"Total Tokens: {self.total_prompt_tokens + self.total_generation_tokens}"
         )
-        logger.info(f"Avg Input TPS: {self.total_prompt_tokens / self.duration}")
-        logger.info(f"Avg Output TPS: {self.total_generation_tokens / self.duration}")
+        logger.info(f"Avg Input TPS: {self.total_prompt_tokens / self.duration:.2f}")
         logger.info(
-            f"Avg TPS: {(self.total_prompt_tokens + self.total_generation_tokens) / self.duration}"
+            f"Avg Output TPS: {self.total_generation_tokens / self.duration:.2f}"
+        )
+        logger.info(
+            f"Avg TPS: {(self.total_prompt_tokens + self.total_generation_tokens) / self.duration:.2f}"
         )
 
     async def run(self) -> None:
