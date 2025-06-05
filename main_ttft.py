@@ -15,7 +15,7 @@ import numpy as np
 import plotly.graph_objs as go
 from plotly.subplots import make_subplots
 
-from prompt import LONG_PROMPT_PAIRS, SHORT_PROMPTS
+from prompt import LONG_PROMPT_PAIRS
 
 # Configure logging
 logging.basicConfig(
@@ -25,9 +25,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TIMEOUT = 60 * 10
-WARMUP_TIME = 60  # 2 minutes
-PROMPT_LENGTH = 9000  # 4500 + 500 = 5000
-MAX_TOKENS = 9000 + 2000
+WARMUP_TIME = 6  # 2 minutes
+# PROMPT_LENGTH = 9000  # 4500 + 500 = 5000
+# MAX_TOKENS = 9000 + 2000
+PROMPT_LENGTH = 4500
+MAX_TOKENS = 4500 + 500
 
 
 def get_timestamp():
@@ -51,7 +53,7 @@ class VLLMTTFTBenchmark:
         self.max_connections = initial_max_connections
         self.duration = duration
         self.target_qps = target_qps
-        self.current_qps = target_qps * 20  # Start with 20x QPS
+        self.current_qps = target_qps * 1  # Start with 10x QPS
         self.api_key = api_key
         self.model = model
 
@@ -78,6 +80,7 @@ class VLLMTTFTBenchmark:
         self.active_requests = 0
         self.total_requests = 0
         self.successful_requests = 0
+        self.failed_requests = 0
         self.start_time: Optional[float] = None
         self.stop_event = asyncio.Event()
 
@@ -117,7 +120,7 @@ class VLLMTTFTBenchmark:
         request_start_time: float,
         first_token_received: bool,
         first_token_time: Optional[float],
-    ) -> None:
+    ) -> bool:
         """Process a single line from the stream response."""
         if not line_text.startswith("data: "):
             return
@@ -128,20 +131,21 @@ class VLLMTTFTBenchmark:
 
         try:
             data = json.loads(json_str)
-            if "usage" in data:
+            if "usage" in data and not self.is_warmup():
                 self._update_token_usage(data["usage"])
 
-            if not first_token_received:
-                first_token_time = time.time()
-                first_token_received = True
-                # Record TTFT
+            # Record TTFT
+            first_token_time = time.time()
+            first_token_received = True
+            if not self.is_warmup():
                 ttft = first_token_time - request_start_time
                 self.metrics_data["ttft"].append(ttft)
-
         except json.JSONDecodeError:
             logger.warning(f"Failed to parse JSON from stream: {line_text}")
         except Exception as e:
             logger.warning(f"Error processing stream chunk: {e}")
+
+        return first_token_received
 
     def _update_token_usage(self, usage: dict) -> None:
         """Update token usage statistics."""
@@ -150,12 +154,17 @@ class VLLMTTFTBenchmark:
         if "completion_tokens" in usage:
             self.total_generation_tokens += usage["completion_tokens"]
 
-    async def _handle_request_timeout(self, request_start_time: float) -> bool:
+    async def _handle_request_timeout(self, connected_time: float) -> bool:
         """Check if request has timeout waiting for first token."""
-        if time.time() - request_start_time > 20:
+        if time.time() - connected_time > 20:
+            logger.warning(f"Request timed out after 20 seconds")
             self.timeout_count += 1
+            self.failed_requests += 1
             return True
         return False
+
+    def is_warmup(self) -> bool:
+        return time.time() < self.start_time + WARMUP_TIME
 
     async def send_request(self) -> None:
         """Send a request to the vLLM service and process the response."""
@@ -176,14 +185,12 @@ class VLLMTTFTBenchmark:
                     timeout=TIMEOUT,
                 ) as response:
                     if response.status == 200:
+                        connected_time = time.time()
                         async for line in response.content:
-                            # Do not handle warmup requests
-                            if time.time() < self.start_time + WARMUP_TIME:
-                                continue
-
                             # Check for timeout
-                            if await self._handle_request_timeout(request_start_time):
-                                return
+                            if not first_token_received:
+                                if await self._handle_request_timeout(connected_time):
+                                    return
 
                             if line:
                                 line_text = line.decode("utf-8").strip()
@@ -200,6 +207,7 @@ class VLLMTTFTBenchmark:
         except asyncio.TimeoutError:
             logger.warning(f"Request timed out after {TIMEOUT} seconds")
             self.timeout_count += 1
+            self.failed_requests += 1
         except Exception as e:
             logger.error(f"Request error: {str(e)}")
             # Log detailed exception information
@@ -295,8 +303,10 @@ class VLLMTTFTBenchmark:
                     10, len(self.metrics_data["ttft"])
                 )
                 logger.info(
-                    f"Finished: {self.total_requests}, "
+                    f"Sent: {self.total_requests}, "
                     f"Active: {self.active_requests}, "
+                    f"Success: {self.successful_requests}, "
+                    f"Failed: {self.failed_requests}, "
                     f"Max Conn: {self.max_connections}, "
                     f"Current QPS: {self.current_qps:.2f}, "
                     f"Avg TTFT: {avg_ttft:.2f}s, "
