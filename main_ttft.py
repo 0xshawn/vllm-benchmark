@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 import aiohttp
 import numpy as np
 import plotly.graph_objs as go
+import requests
 from plotly.subplots import make_subplots
 from pydantic import BaseModel
 
@@ -28,16 +29,23 @@ logger = logging.getLogger(__name__)
 
 TIMEOUT = 60 * 10
 WARMUP_TIME = 180  # 3 minutes
-PROMPT_LENGTH = 9000  # 4500 + 500 = 5000
-MAX_TOKENS = 9000 + 2000
-# PROMPT_LENGTH = 4500
-# MAX_TOKENS = 4500 + 500
+# PROMPT_LENGTH = 9000  # 4500 + 500 = 5000
+# MAX_TOKENS = 9000 + 2000
+PROMPT_LENGTH = 4500
+MAX_TOKENS = 4500 + 500
 
-MAX_CONNECTIONS = 2500
+MAX_CONNECTIONS = 1200
+WORDS = None
 
 
 def get_timestamp():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def fetch_words():
+    word_site = "https://www.mit.edu/~ecprice/wordlist.10000"
+    response = requests.get(word_site)
+    return response.content.splitlines()
 
 
 class RequestContext(BaseModel):
@@ -167,6 +175,7 @@ class VLLMTTFTBenchmark:
             while len(content) < PROMPT_LENGTH:
                 content += "\n\n" + content
             content = content[:PROMPT_LENGTH]  # Trim to exact length if needed
+        content = f"{random.choice(WORDS)} {content}"
 
         payload = {
             "model": self.model,
@@ -219,8 +228,8 @@ class VLLMTTFTBenchmark:
 
     async def is_ttft_timeout(self, ctx: RequestContext) -> bool:
         """Check if request has timeout waiting for first token."""
-        if time.time() - ctx.connected_time > 30:
-            logger.error(f"TTFT > 30, cancel request")
+        if time.time() - ctx.connected_time > 20:
+            logger.error(f"TTFT > 20, cancel request")
             return True
         return False
 
@@ -562,6 +571,9 @@ class VLLMTTFTBenchmark:
 
     async def run(self) -> None:
         """Run the benchmark."""
+        global WORDS
+        WORDS = fetch_words()
+
         self.start_time = time.time()
 
         # Create tasks for monitoring metrics and generating load
