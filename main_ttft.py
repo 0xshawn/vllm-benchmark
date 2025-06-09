@@ -34,7 +34,7 @@ WARMUP_TIME = 180  # 3 minutes
 PROMPT_LENGTH = 4500
 MAX_TOKENS = 4500 + 500
 
-MAX_CONNECTIONS = 1200
+MAX_CONNECTIONS = 1500
 WORDS = None
 
 
@@ -86,7 +86,7 @@ class VLLMTTFTBenchmark:
         self.max_connections = initial_max_connections
         self.duration = duration
         self.target_qps = target_qps
-        self.current_qps = target_qps * 5  # Start with 1x QPS
+        self.current_qps = target_qps * 20  # Start with 1x QPS
         self.api_key = api_key
         self.model = model
 
@@ -206,7 +206,7 @@ class VLLMTTFTBenchmark:
 
         try:
             data = json.loads(json_str)
-            if "usage" in data and not self.is_warmup():
+            if data.get("usage") and not self.is_warmup():
                 self._update_token_usage(data["usage"])
                 ctx.prompt_tokens = data["usage"].get("prompt_tokens", 0)
                 ctx.generation_tokens = data["usage"].get("completion_tokens", 0)
