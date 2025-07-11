@@ -28,13 +28,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TIMEOUT = 60 * 10
-WARMUP_TIME = 180  # 3 minutes
+WARMUP_TIME = 30  # 3 minutes
 # PROMPT_LENGTH = 9000  # 4500 + 500 = 5000
 # MAX_TOKENS = 9000 + 2000
 PROMPT_LENGTH = 4500
 MAX_TOKENS = 4500 + 500
 
-MAX_CONNECTIONS = 1500
+MAX_CONNECTIONS = 1200
 WORDS = None
 
 
