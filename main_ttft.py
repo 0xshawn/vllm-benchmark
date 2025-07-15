@@ -34,7 +34,7 @@ WARMUP_TIME = 30  # 3 minutes
 PROMPT_LENGTH = 4500
 MAX_TOKENS = 4500 + 500
 
-MAX_CONNECTIONS = 1200
+MAX_CONNECTIONS = 500
 WORDS = None
 
 
@@ -331,6 +331,7 @@ class VLLMTTFTBenchmark:
                 )
 
         self.max_connections = min(self.max_connections, MAX_CONNECTIONS)
+        self.max_connections = max(self.max_connections, self.initial_max_connections)
 
         # Reset counters
         self.timeout_count = 0
