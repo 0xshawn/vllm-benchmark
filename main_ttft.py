@@ -28,13 +28,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TIMEOUT = 60 * 10
-WARMUP_TIME = 30  # 3 minutes
+WARMUP_TIME = 30  # 1 minutes
 # PROMPT_LENGTH = 9000  # 4500 + 500 = 5000
 # MAX_TOKENS = 9000 + 2000
 PROMPT_LENGTH = 4500
 MAX_TOKENS = 4500 + 500
 
-MAX_CONNECTIONS = 500
 WORDS = None
 
 
@@ -76,14 +75,17 @@ class VLLMTTFTBenchmark:
         self,
         vllm_url: str,
         initial_max_connections: int,
+        max_connections: int,
         duration: int,
         target_qps: float,
         api_key: Optional[str],
         model: str,
+        adjustment_step: int = 100,
     ):
         self.vllm_url = vllm_url.rstrip("/")
         self.initial_max_connections = initial_max_connections
         self.max_connections = initial_max_connections
+        self.max_connections_limit = max_connections
         self.duration = duration
         self.target_qps = target_qps
         self.current_qps = target_qps * 20  # Start with 1x QPS
@@ -118,7 +120,7 @@ class VLLMTTFTBenchmark:
         self.stop_event = asyncio.Event()
 
         # TTFT tracking for gradual adjustments
-        self.adjustment_step = 100
+        self.adjustment_step = adjustment_step
         self.timeout_count = 0
         self.last_timeout_check = 0
         self.timeout_check_interval = 30
@@ -320,6 +322,8 @@ class VLLMTTFTBenchmark:
 
         if self.timeout_count > 0:
             self.max_connections = self.max_connections - self.adjustment_step
+            if self.max_connections < self.initial_max_connections:
+                self.max_connections = self.initial_max_connections
             logger.info(
                 f"Reducing max_connections to {self.max_connections} due to high timeout rate"
             )
@@ -330,7 +334,7 @@ class VLLMTTFTBenchmark:
                     f"Increasing max_connections to {self.max_connections} due to low timeout rate"
                 )
 
-        self.max_connections = min(self.max_connections, MAX_CONNECTIONS)
+        self.max_connections = min(self.max_connections, self.max_connections_limit)
         self.max_connections = max(self.max_connections, self.initial_max_connections)
 
         # Reset counters
@@ -613,6 +617,12 @@ def parse_args():
         help="Initial maximum concurrent connections (default: 10)",
     )
     parser.add_argument(
+        "--max-connections",
+        type=int,
+        default=500,
+        help="Maximum concurrent connections limit (default: 500)",
+    )
+    parser.add_argument(
         "--duration",
         type=int,
         default=60,
@@ -635,9 +645,10 @@ def parse_args():
         help="Model name for requests (default: phala/deepseek-r1-70b)",
     )
     parser.add_argument(
-        "--long-context",
-        action="store_true",
-        help="Use long context for requests (default: False)",
+        "--adjustment-step",
+        type=int,
+        default=100,
+        help="Step size for adjusting max connections (default: 100)",
     )
     return parser.parse_args()
 
@@ -648,10 +659,12 @@ def main():
     benchmark = VLLMTTFTBenchmark(
         vllm_url=args.vllm_url,
         initial_max_connections=args.initial_max_connections,
+        max_connections=args.max_connections,
         duration=args.duration,
         target_qps=args.qps,
         api_key=args.api_key,
         model=args.model,
+        adjustment_step=args.adjustment_step,
     )
 
     asyncio.run(benchmark.run())
